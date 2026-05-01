@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import inducks
+from . import gcd, inducks
+from .config import DB_PATH, DEFAULT_YEAR_PAGINATION_THRESHOLD
 from .db import get_conn, has_inducks_data, init_collection_tables
 
 def _find_frontend() -> Path:
@@ -79,14 +80,171 @@ def sync_status():
 # --------------------------------------------------------------- browse
 
 def _owned_pubcodes(conn) -> set[str]:
-    rows = conn.execute(
+    """Set of publication codes (Inducks pubcodes + cp:<id> for customs) the
+    user owns at least one issue of."""
+    inducks_owned = conn.execute(
         """
         SELECT DISTINCT i.publicationcode
         FROM collection_item ci
         JOIN inducks_issue i ON i.issuecode = ci.issuecode
         """
     ).fetchall()
-    return {r[0] for r in rows}
+    custom_owned = conn.execute(
+        """
+        SELECT DISTINCT 'cp:' || cii.publication_id
+        FROM collection_item ci
+        JOIN custom_issue cii ON ('ci:' || cii.id) = ci.issuecode
+        """
+    ).fetchall()
+    return {r[0] for r in inducks_owned} | {r[0] for r in custom_owned}
+
+
+def _is_custom_pub(code: str) -> bool:
+    return code.startswith("cp:")
+
+
+def _is_custom_issue(code: str) -> bool:
+    return code.startswith("ci:")
+
+
+def _custom_pub_id(code: str) -> int:
+    return int(code.split(":", 1)[1])
+
+
+def _custom_issue_id(code: str) -> int:
+    return int(code.split(":", 1)[1])
+
+
+def _custom_publication_detail(pub_id: int):
+    with get_conn() as conn:
+        pub = conn.execute(
+            """
+            SELECT cp.*, c.countryname
+            FROM custom_publication cp
+            LEFT JOIN inducks_country c ON c.countrycode = cp.countrycode
+            WHERE cp.id = ?
+            """,
+            (pub_id,),
+        ).fetchone()
+        if not pub:
+            raise HTTPException(404, "Publication not found")
+
+        issues = conn.execute(
+            """
+            SELECT id, issuenumber, title, oldestdate
+            FROM custom_issue
+            WHERE publication_id = ?
+            ORDER BY position
+            """,
+            (pub_id,),
+        ).fetchall()
+
+        owned = conn.execute(
+            """
+            SELECT ci.id, ci.issuecode, ci.condition, ci.location_id, ci.notes,
+                   l.name AS location_name
+            FROM collection_item ci
+            LEFT JOIN collection_location l ON l.id = ci.location_id
+            JOIN custom_issue cii ON ('ci:' || cii.id) = ci.issuecode
+            WHERE cii.publication_id = ?
+            """,
+            (pub_id,),
+        ).fetchall()
+
+    owned_map: dict[str, list] = {}
+    for o in owned:
+        owned_map.setdefault(o["issuecode"], []).append({
+            "id": o["id"],
+            "condition": o["condition"],
+            "location_id": o["location_id"],
+            "location_name": o["location_name"],
+            "notes": o["notes"],
+        })
+
+    return {
+        "publicationcode": f"cp:{pub_id}",
+        "title": pub["title"],
+        "countrycode": pub["countrycode"],
+        "country_name": pub["countryname"],
+        "languagecode": pub["languagecode"],
+        "publisher": pub["publisher"],
+        "year_began": pub["year_began"],
+        "year_ended": pub["year_ended"],
+        "source": pub["source"],
+        "total_issues": len(issues),
+        "years": [],            # no year-tab pagination for custom (yet)
+        "selected_year": None,
+        "issues": [
+            {
+                "issuecode": f"ci:{r['id']}",
+                "issuenumber": r["issuenumber"],
+                "title": r["title"],
+                "oldestdate": r["oldestdate"],
+                "owned": owned_map.get(f"ci:{r['id']}", []),
+            }
+            for r in issues
+        ],
+    }
+
+
+def _custom_issue_detail(issue_id: int):
+    with get_conn() as conn:
+        # Lazy-fetch GCD details (title/date/cover) on first detail view too,
+        # so the detail page shows real data even before the cover loads.
+        row = _enrich_custom_issue(conn, issue_id)
+        if not row:
+            raise HTTPException(404, "Issue not found")
+        pub = conn.execute(
+            """
+            SELECT cp.id, cp.title, cp.countrycode, c.countryname
+            FROM custom_publication cp
+            LEFT JOIN inducks_country c ON c.countrycode = cp.countrycode
+            WHERE cp.id = (SELECT publication_id FROM custom_issue WHERE id = ?)
+            """,
+            (issue_id,),
+        ).fetchone()
+
+        owned = conn.execute(
+            """
+            SELECT ci.id, ci.condition, ci.location_id, ci.notes, l.name AS location_name
+            FROM collection_item ci
+            LEFT JOIN collection_location l ON l.id = ci.location_id
+            WHERE ci.issuecode = ?
+            """,
+            (f"ci:{issue_id}",),
+        ).fetchall()
+
+    return {
+        "issuecode": f"ci:{issue_id}",
+        "publicationcode": f"cp:{pub['id']}" if pub else None,
+        "publication_title": pub["title"] if pub else None,
+        "countrycode": pub["countrycode"] if pub else None,
+        "country_name": pub["countryname"] if pub else None,
+        "issuenumber": row["issuenumber"],
+        "title": row["title"],
+        "oldestdate": row["oldestdate"],
+        "stories": [],            # GCD has stories too but we don't import them
+        "owned": [
+            {
+                "id": o["id"],
+                "condition": o["condition"],
+                "location_id": o["location_id"],
+                "location_name": o["location_name"],
+                "notes": o["notes"],
+            }
+            for o in owned
+        ],
+    }
+
+
+# SQL fragment: every publication, Inducks or custom, with a uniform shape.
+_ALL_PUBS_SQL = """(
+    SELECT publicationcode AS code, title, countrycode, languagecode
+    FROM inducks_publication
+    UNION ALL
+    SELECT 'cp:' || id AS code, title, countrycode, languagecode
+    FROM custom_publication
+)"""
 
 
 @app.get("/api/countries")
@@ -97,57 +255,35 @@ def list_countries(filter: str = "all"):
         if not has_inducks_data():
             return []
 
+        owned = _owned_pubcodes(conn) if filter != "all" else None
+        if filter == "owned" and not owned:
+            return []
+
         if filter == "all":
-            rows = conn.execute(
-                """
-                SELECT c.countrycode, c.countryname, COUNT(p.publicationcode)
-                FROM inducks_country c
-                JOIN inducks_publication p ON p.countrycode = c.countrycode
-                GROUP BY c.countrycode, c.countryname
-                ORDER BY c.countryname
-                """
-            ).fetchall()
-        else:
-            owned = _owned_pubcodes(conn)
-            if filter == "owned":
-                if not owned:
-                    return []
+            where, params = "", ()
+        elif filter == "owned":
+            ph = ",".join("?" * len(owned))
+            where = f"WHERE p.code IN ({ph})"
+            params = tuple(owned)
+        else:  # missing
+            if not owned:
+                where, params = "", ()
+            else:
                 ph = ",".join("?" * len(owned))
-                rows = conn.execute(
-                    f"""
-                    SELECT c.countrycode, c.countryname, COUNT(DISTINCT p.publicationcode)
-                    FROM inducks_country c
-                    JOIN inducks_publication p ON p.countrycode = c.countrycode
-                    WHERE p.publicationcode IN ({ph})
-                    GROUP BY c.countrycode, c.countryname
-                    ORDER BY c.countryname
-                    """,
-                    tuple(owned),
-                ).fetchall()
-            else:  # missing
-                if not owned:
-                    rows = conn.execute(
-                        """
-                        SELECT c.countrycode, c.countryname, COUNT(p.publicationcode)
-                        FROM inducks_country c
-                        JOIN inducks_publication p ON p.countrycode = c.countrycode
-                        GROUP BY c.countrycode, c.countryname
-                        ORDER BY c.countryname
-                        """
-                    ).fetchall()
-                else:
-                    ph = ",".join("?" * len(owned))
-                    rows = conn.execute(
-                        f"""
-                        SELECT c.countrycode, c.countryname, COUNT(DISTINCT p.publicationcode)
-                        FROM inducks_country c
-                        JOIN inducks_publication p ON p.countrycode = c.countrycode
-                        WHERE p.publicationcode NOT IN ({ph})
-                        GROUP BY c.countrycode, c.countryname
-                        ORDER BY c.countryname
-                        """,
-                        tuple(owned),
-                    ).fetchall()
+                where = f"WHERE p.code NOT IN ({ph})"
+                params = tuple(owned)
+
+        rows = conn.execute(
+            f"""
+            SELECT c.countrycode, c.countryname, COUNT(DISTINCT p.code)
+            FROM inducks_country c
+            JOIN {_ALL_PUBS_SQL} p ON p.countrycode = c.countrycode
+            {where}
+            GROUP BY c.countrycode, c.countryname
+            ORDER BY c.countryname
+            """,
+            params,
+        ).fetchall()
         return [{"code": r[0], "name": r[1], "count": r[2]} for r in rows if r[2] > 0]
 
 
@@ -175,23 +311,23 @@ def list_publications(
             owned = _owned_pubcodes(conn)
             if not owned:
                 return {"total": 0, "items": []}
-            clauses.append(f"p.publicationcode IN ({','.join('?' * len(owned))})")
+            clauses.append(f"p.code IN ({','.join('?' * len(owned))})")
             params.extend(owned)
         elif filter == "missing":
             owned = _owned_pubcodes(conn)
             if owned:
-                clauses.append(f"p.publicationcode NOT IN ({','.join('?' * len(owned))})")
+                clauses.append(f"p.code NOT IN ({','.join('?' * len(owned))})")
                 params.extend(owned)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         total = conn.execute(
-            f"SELECT COUNT(*) FROM inducks_publication p {where}", params
+            f"SELECT COUNT(*) FROM {_ALL_PUBS_SQL} p {where}", params
         ).fetchone()[0]
 
         rows = conn.execute(
             f"""
-            SELECT p.publicationcode, p.title, p.countrycode, p.languagecode
-            FROM inducks_publication p
+            SELECT p.code, p.title, p.countrycode, p.languagecode
+            FROM {_ALL_PUBS_SQL} p
             {where}
             ORDER BY p.title
             LIMIT ? OFFSET ?
@@ -199,22 +335,28 @@ def list_publications(
             (*params, limit, offset),
         ).fetchall()
 
-        # Owned counts in one shot
+        # Owned counts in one query that handles both Inducks and custom items.
         owned_counts: dict[str, int] = {}
         if rows:
             pcodes = [r[0] for r in rows]
             ph = ",".join("?" * len(pcodes))
-            for pc, n in conn.execute(
+            for code, n in conn.execute(
                 f"""
-                SELECT i.publicationcode, COUNT(DISTINCT ci.issuecode)
-                FROM collection_item ci
-                JOIN inducks_issue i ON i.issuecode = ci.issuecode
-                WHERE i.publicationcode IN ({ph})
-                GROUP BY i.publicationcode
+                SELECT code, COUNT(DISTINCT issuecode) FROM (
+                    SELECT i.publicationcode AS code, ci.issuecode
+                    FROM collection_item ci
+                    JOIN inducks_issue i ON i.issuecode = ci.issuecode
+                    WHERE i.publicationcode IN ({ph})
+                    UNION ALL
+                    SELECT 'cp:' || cii.publication_id AS code, ci.issuecode
+                    FROM collection_item ci
+                    JOIN custom_issue cii ON ('ci:' || cii.id) = ci.issuecode
+                    WHERE 'cp:' || cii.publication_id IN ({ph})
+                ) GROUP BY code
                 """,
-                pcodes,
+                (*pcodes, *pcodes),
             ).fetchall():
-                owned_counts[pc] = n
+                owned_counts[code] = n
 
     return {
         "total": total,
@@ -231,41 +373,101 @@ def list_publications(
     }
 
 
+def _get_setting(conn, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM app_setting WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def _set_setting(conn, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO app_setting (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
 @app.get("/api/publications/{publicationcode:path}")
-def publication_detail(publicationcode: str):
+def publication_detail(publicationcode: str, year: Optional[str] = None):
+    if _is_custom_pub(publicationcode):
+        return _custom_publication_detail(_custom_pub_id(publicationcode))
+
     with get_conn() as conn:
         pub = conn.execute(
-            "SELECT publicationcode, title, countrycode, languagecode FROM inducks_publication WHERE publicationcode = ?",
+            """
+            SELECT p.publicationcode, p.title, p.countrycode, p.languagecode,
+                   c.countryname
+            FROM inducks_publication p
+            LEFT JOIN inducks_country c ON c.countrycode = p.countrycode
+            WHERE p.publicationcode = ?
+            """,
             (publicationcode,),
         ).fetchone()
         if not pub:
             raise HTTPException(404, "Publication not found")
 
-        country = conn.execute(
-            "SELECT countryname FROM inducks_country WHERE countrycode = ?",
-            (pub["countrycode"],),
-        ).fetchone()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM inducks_issue WHERE publicationcode = ?",
+            (publicationcode,),
+        ).fetchone()[0]
 
-        issues = conn.execute(
+        # Year breakdown — substr(oldestdate, 1, 4) yields YYYY when present.
+        year_rows = conn.execute(
             """
-            SELECT i.issuecode, i.issuenumber, i.title, i.oldestdate
-            FROM inducks_issue i
-            WHERE i.publicationcode = ?
-            ORDER BY i.oldestdate, i.issuenumber
+            SELECT substr(oldestdate, 1, 4) AS yr, COUNT(*) AS n
+            FROM inducks_issue
+            WHERE publicationcode = ?
+              AND oldestdate IS NOT NULL
+              AND length(oldestdate) >= 4
+            GROUP BY yr
+            HAVING yr != ''
+            ORDER BY yr
             """,
             (publicationcode,),
         ).fetchall()
+        years = [{"year": r[0], "count": r[1]} for r in year_rows]
+        dated = sum(y["count"] for y in years)
 
+        # Auto-paginate when the run is large *and* most issues carry a year.
+        threshold = int(_get_setting(
+            conn, "year_pagination_threshold",
+            str(DEFAULT_YEAR_PAGINATION_THRESHOLD),
+        ))
+        paginate = total > threshold and dated >= total // 2
+
+        if paginate:
+            selected_year = year or (years[-1]["year"] if years else None)
+        else:
+            selected_year = year       # honour explicit ?year=YYYY anyway
+            years = []                  # no tabs in the UI
+
+        issue_params: list = [publicationcode]
+        issue_where = "WHERE i.publicationcode = ?"
+        if selected_year:
+            issue_where += " AND substr(i.oldestdate, 1, 4) = ?"
+            issue_params.append(selected_year)
+
+        issues = conn.execute(
+            f"""
+            SELECT i.issuecode, i.issuenumber, i.title, i.oldestdate
+            FROM inducks_issue i
+            {issue_where}
+            ORDER BY i.oldestdate, i.issuenumber
+            """,
+            issue_params,
+        ).fetchall()
+
+        # Owned items for the issues on this page only — keeps the
+        # owned_map join cheap when paginating a huge run.
         owned = conn.execute(
-            """
+            f"""
             SELECT ci.id, ci.issuecode, ci.condition, ci.location_id, ci.notes,
                    l.name AS location_name
             FROM collection_item ci
             LEFT JOIN collection_location l ON l.id = ci.location_id
             JOIN inducks_issue i ON i.issuecode = ci.issuecode
-            WHERE i.publicationcode = ?
+            {issue_where.replace('i.publicationcode', 'i.publicationcode')}
             """,
-            (publicationcode,),
+            issue_params,
         ).fetchall()
 
     owned_map: dict[str, list] = {}
@@ -282,8 +484,11 @@ def publication_detail(publicationcode: str):
         "publicationcode": pub["publicationcode"],
         "title": pub["title"],
         "countrycode": pub["countrycode"],
-        "country_name": country["countryname"] if country else None,
+        "country_name": pub["countryname"],
         "languagecode": pub["languagecode"],
+        "total_issues": total,
+        "years": years,
+        "selected_year": selected_year,
         "issues": [
             {
                 "issuecode": r["issuecode"],
@@ -299,6 +504,9 @@ def publication_detail(publicationcode: str):
 
 @app.get("/api/issues/{issuecode:path}")
 def issue_detail(issuecode: str):
+    if _is_custom_issue(issuecode):
+        return _custom_issue_detail(_custom_issue_id(issuecode))
+
     with get_conn() as conn:
         issue = conn.execute(
             "SELECT issuecode, publicationcode, issuenumber, title, oldestdate FROM inducks_issue WHERE issuecode = ?",
@@ -534,6 +742,31 @@ class ConditionIn(BaseModel):
     name: str
 
 
+# ---------- app-wide settings (key/value) ----------
+
+class AppSettingsPatch(BaseModel):
+    year_pagination_threshold: Optional[int] = None
+
+
+@app.get("/api/app-settings")
+def app_settings_get():
+    with get_conn() as conn:
+        threshold = _get_setting(
+            conn, "year_pagination_threshold",
+            str(DEFAULT_YEAR_PAGINATION_THRESHOLD),
+        )
+    return {"year_pagination_threshold": int(threshold)}
+
+
+@app.patch("/api/app-settings")
+def app_settings_patch(body: AppSettingsPatch):
+    with get_conn() as conn:
+        if body.year_pagination_threshold is not None:
+            v = max(1, int(body.year_pagination_threshold))
+            _set_setting(conn, "year_pagination_threshold", str(v))
+    return {"ok": True}
+
+
 @app.get("/api/conditions")
 def conditions_list():
     with get_conn() as conn:
@@ -569,24 +802,225 @@ def conditions_delete(cond_id: int):
     return {"ok": True}
 
 
+# --------------------------------------------------- GCD / custom publications
+
+class GcdImportIn(BaseModel):
+    series_id: str
+
+
+@app.get("/api/gcd/search")
+def gcd_search(q: str = Query(..., min_length=2)):
+    try:
+        return gcd.search_series(q)
+    except Exception as e:
+        raise HTTPException(502, f"GCD search failed: {e}")
+
+
+@app.get("/api/custom-publications")
+def custom_publications_list():
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT cp.id, cp.source, cp.source_id, cp.title, cp.countrycode,
+                   cp.languagecode, cp.publisher, cp.year_began, cp.year_ended,
+                   COUNT(cii.id) AS issue_count,
+                   SUM(CASE WHEN cii.cover_url IS NOT NULL AND cii.cover_url != ''
+                            THEN 1 ELSE 0 END) AS enriched_count
+            FROM custom_publication cp
+            LEFT JOIN custom_issue cii ON cii.publication_id = cp.id
+            GROUP BY cp.id
+            ORDER BY cp.title
+            """
+        ).fetchall()
+    return [
+        dict(r) | {
+            "publicationcode": f"cp:{r['id']}",
+            "enrich_status": gcd.get_enrich_status(r["id"]),
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/custom-publications/import-gcd")
+def custom_publications_import_gcd(body: GcdImportIn):
+    try:
+        series = gcd.fetch_series(body.series_id)
+    except Exception as e:
+        raise HTTPException(502, f"GCD fetch failed: {e}")
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM custom_publication WHERE source = 'gcd' AND source_id = ?",
+            (series["source_id"],),
+        ).fetchone()
+        if existing:
+            raise HTTPException(409, "This series is already imported")
+
+        cur = conn.execute(
+            """
+            INSERT INTO custom_publication
+                (source, source_id, title, countrycode, languagecode,
+                 publisher, year_began, year_ended)
+            VALUES ('gcd', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                series["source_id"], series["title"],
+                series["countrycode"], series["languagecode"],
+                series["publisher"], series["year_began"], series["year_ended"],
+            ),
+        )
+        pub_id = cur.lastrowid
+
+        conn.executemany(
+            """
+            INSERT INTO custom_issue
+                (publication_id, source_id, issuenumber, position)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (pub_id, i.get("source_id"), i.get("issuenumber", ""), i["position"])
+                for i in series["issues"]
+            ],
+        )
+
+    # Kick off the per-issue enrichment job — populates cover_url / title /
+    # date for every issue in the background, throttled to GCD's rate limit.
+    gcd.start_enrichment(pub_id, str(DB_PATH))
+    return {"id": pub_id, "publicationcode": f"cp:{pub_id}", "issue_count": len(series["issues"])}
+
+
+@app.post("/api/custom-publications/{pub_id}/enrich")
+def custom_publications_enrich(pub_id: int):
+    with get_conn() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM custom_publication WHERE id = ?", (pub_id,)
+        ).fetchone():
+            raise HTTPException(404, "Publication not found")
+    if not gcd.start_enrichment(pub_id, str(DB_PATH)):
+        raise HTTPException(409, "Enrichment already running")
+    return {"ok": True}
+
+
+@app.get("/api/custom-publications/{pub_id}/enrich")
+def custom_publications_enrich_status(pub_id: int):
+    return gcd.get_enrich_status(pub_id)
+
+
+@app.delete("/api/custom-publications/{pub_id}")
+def custom_publications_delete(pub_id: int):
+    with get_conn() as conn:
+        # Drop any owned copies whose issuecode points at this publication's
+        # custom issues, then drop the publication (cascade deletes the issues).
+        conn.execute(
+            """
+            DELETE FROM collection_item
+            WHERE issuecode IN (
+                SELECT 'ci:' || id FROM custom_issue WHERE publication_id = ?
+            )
+            """,
+            (pub_id,),
+        )
+        conn.execute("DELETE FROM custom_publication WHERE id = ?", (pub_id,))
+    return {"ok": True}
+
+
 # ----------------------------------------------------------------- covers
 
 # Once a cover is fetched its bytes never change (filename is md5(issuecode)),
 # so let the browser keep them for a year.
 _COVER_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
 
+# Returned in place of a 404 / 502 / auth error so the browser draws something
+# instead of a broken-image icon. Short cache (60 s) means transient failures
+# (e.g. GCD 429, brief network hiccups) recover on the next page load. Never
+# written to the on-disk cover cache, so a real cover that *does* eventually
+# show up is fetched and stored normally.
+_PLACEHOLDER_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 320" '
+    b'preserveAspectRatio="xMidYMid meet">'
+    b'<rect width="240" height="320" fill="#f8fafc" stroke="#cbd5e1" '
+    b'stroke-width="2" stroke-dasharray="6,4"/>'
+    b'<g transform="translate(120 130)" fill="none" stroke="#94a3b8" '
+    b'stroke-width="3" stroke-linecap="round" stroke-linejoin="round">'
+    b'<rect x="-34" y="-44" width="68" height="84" rx="4"/>'
+    b'<circle cx="-12" cy="-24" r="6" fill="#94a3b8"/>'
+    b'<path d="M-32 32 L-10 4 L6 22 L20 -6 L34 32 Z" fill="#94a3b8"/>'
+    b'</g>'
+    b'<text x="120" y="220" font-family="sans-serif" font-size="14" '
+    b'fill="#64748b" text-anchor="middle">Cover not available</text>'
+    b'</svg>'
+)
+_PLACEHOLDER_HEADERS = {"Cache-Control": "public, max-age=60"}
+
+
+def _placeholder() -> Response:
+    return Response(
+        content=_PLACEHOLDER_SVG,
+        media_type="image/svg+xml",
+        headers=_PLACEHOLDER_HEADERS,
+    )
+
+
+def _enrich_custom_issue(conn, issue_id: int) -> dict | None:
+    """Lazy-fetch missing GCD metadata (cover URL, date, title) for a custom
+    issue. Persists what it finds. Returns the up-to-date row as a dict, or
+    None if the issue does not exist."""
+    row = conn.execute(
+        "SELECT id, source_id, issuenumber, title, oldestdate, cover_url "
+        "FROM custom_issue WHERE id = ?",
+        (issue_id,),
+    ).fetchone()
+    if not row:
+        return None
+    if row["cover_url"] or not row["source_id"]:
+        return dict(row)
+    # While GCD is asking us to back off, skip the API call entirely so the
+    # cover endpoint falls through to the placeholder without waiting out the
+    # full cooldown. The background enrichment job will catch up later.
+    if gcd.throttle_seconds_remaining() > 0:
+        return dict(row)
+    try:
+        meta = gcd.fetch_issue(row["source_id"])
+    except Exception:
+        return dict(row)
+    conn.execute(
+        """
+        UPDATE custom_issue
+        SET cover_url = ?,
+            title = COALESCE(NULLIF(title, ''), ?),
+            oldestdate = COALESCE(NULLIF(oldestdate, ''), ?)
+        WHERE id = ?
+        """,
+        (meta["cover_url"], meta["title"], meta["oldestdate"], issue_id),
+    )
+    return {
+        **dict(row),
+        "cover_url": meta["cover_url"],
+        "title": row["title"] or meta["title"],
+        "oldestdate": row["oldestdate"] or meta["oldestdate"],
+    }
+
 
 @app.get("/api/covers/issue/{issuecode:path}")
 def cover_issue(issuecode: str):
+    """Always returns an image (real or placeholder). Failures fall through
+    to the placeholder so the browser shows *something* instead of a broken
+    icon. The placeholder is never written to disk."""
     try:
-        with get_conn() as conn:
-            res = inducks.fetch_cover_for_issue(conn, issuecode)
-    except PermissionError as e:
-        raise HTTPException(401, str(e))
-    except Exception as e:
-        raise HTTPException(502, str(e))
+        if _is_custom_issue(issuecode):
+            with get_conn() as conn:
+                row = _enrich_custom_issue(conn, _custom_issue_id(issuecode))
+            if not row:
+                return _placeholder()
+            res = gcd.fetch_cover(issuecode, row["cover_url"] or "")
+        else:
+            with get_conn() as conn:
+                res = inducks.fetch_cover_for_issue(conn, issuecode)
+    except Exception:
+        return _placeholder()
+
     if not res:
-        raise HTTPException(404, "No cover registered for this issue")
+        return _placeholder()
     path, mime = res
     return FileResponse(path, media_type=mime, headers=_COVER_CACHE_HEADERS)
 
@@ -594,14 +1028,24 @@ def cover_issue(issuecode: str):
 @app.get("/api/covers/publication/{publicationcode:path}")
 def cover_publication(publicationcode: str):
     try:
+        if _is_custom_pub(publicationcode):
+            with get_conn() as conn:
+                row = conn.execute(
+                    "SELECT id FROM custom_issue WHERE publication_id = ? "
+                    "ORDER BY position LIMIT 1",
+                    (_custom_pub_id(publicationcode),),
+                ).fetchone()
+            if not row:
+                return _placeholder()
+            return cover_issue(f"ci:{row['id']}")
+
         with get_conn() as conn:
             res = inducks.fetch_icon_for_publication(conn, publicationcode)
-    except PermissionError as e:
-        raise HTTPException(401, str(e))
-    except Exception as e:
-        raise HTTPException(502, str(e))
+    except Exception:
+        return _placeholder()
+
     if not res:
-        raise HTTPException(404, "No cover available for this publication")
+        return _placeholder()
     path, mime = res
     return FileResponse(path, media_type=mime, headers=_COVER_CACHE_HEADERS)
 

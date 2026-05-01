@@ -6,7 +6,6 @@ require a free account and are fetched via an HR proxy on inducks.org.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 import shutil
 import sqlite3
@@ -19,7 +18,8 @@ from pathlib import Path
 
 import httpx
 
-from .config import COVER_DIR, DB_PATH, SESSION_FILE
+from . import cache
+from .config import DB_PATH, SESSION_FILE
 
 ISV_URL = "https://inducks.org/inducks/isv.tgz"
 LOGIN_URL = "https://inducks.org/maccount.php"
@@ -319,35 +319,12 @@ def _resolve_cover_url(conn: sqlite3.Connection, issuecode: str) -> str | None:
     return row[0] if row else None
 
 
-def _cache_path_for(key: str) -> Path | None:
-    """Return cached cover for `key` (any extension), or None."""
-    safe = hashlib.md5(key.encode()).hexdigest()
-    for ext in (".jpg", ".gif", ".png"):
-        p = COVER_DIR / (safe + ext)
-        if p.exists():
-            return p
-    return None
-
-
-def _cache_write(key: str, content: bytes, content_type: str) -> Path:
-    safe = hashlib.md5(key.encode()).hexdigest()
-    if "gif" in content_type:
-        ext = ".gif"
-    elif "png" in content_type:
-        ext = ".png"
-    else:
-        ext = ".jpg"
-    path = COVER_DIR / (safe + ext)
-    path.write_bytes(content)
-    return path
-
-
 def fetch_cover_for_issue(conn: sqlite3.Connection, issuecode: str) -> tuple[Path, str] | None:
     """Return (path, mime) for a cached or freshly fetched cover. None if no
     image is registered in Inducks for the issue."""
-    cached = _cache_path_for(issuecode)
+    cached = cache.cache_path_for(issuecode)
     if cached:
-        return cached, _mime_from_ext(cached)
+        return cached, cache.mime_from_ext(cached)
 
     cookie = _load_cookie()
     if not cookie:
@@ -368,15 +345,15 @@ def fetch_cover_for_issue(conn: sqlite3.Connection, issuecode: str) -> tuple[Pat
         raise RuntimeError(f"Inducks HR returned HTTP {resp.status_code}")
 
     ctype = resp.headers.get("content-type", "image/jpeg")
-    path = _cache_write(issuecode, resp.content, ctype)
-    return path, _mime_from_ext(path)
+    path = cache.cache_write(issuecode, resp.content, ctype)
+    return path, cache.mime_from_ext(path)
 
 
 def fetch_icon_for_publication(conn: sqlite3.Connection, publicationcode: str) -> tuple[Path, str] | None:
     """Return a representative cover for a publication (its earliest issue)."""
-    cached = _cache_path_for("pub:" + publicationcode)
+    cached = cache.cache_path_for("pub:" + publicationcode)
     if cached:
-        return cached, _mime_from_ext(cached)
+        return cached, cache.mime_from_ext(cached)
 
     row = conn.execute(
         """
@@ -395,9 +372,5 @@ def fetch_icon_for_publication(conn: sqlite3.Connection, publicationcode: str) -
         return None
     # Symlink-ish: copy bytes into a pub: cache key so we don't re-resolve next time
     src, mime = result
-    dest = _cache_write("pub:" + publicationcode, src.read_bytes(), mime)
-    return dest, _mime_from_ext(dest)
-
-
-def _mime_from_ext(p: Path) -> str:
-    return {".jpg": "image/jpeg", ".gif": "image/gif", ".png": "image/png"}.get(p.suffix, "image/jpeg")
+    dest = cache.cache_write("pub:" + publicationcode, src.read_bytes(), mime)
+    return dest, cache.mime_from_ext(dest)

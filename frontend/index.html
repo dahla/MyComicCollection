@@ -171,11 +171,32 @@
       </nav>
       <h1 class="text-2xl font-bold">{{ publication.title }}</h1>
       <p class="text-slate-500 text-sm mb-4">
-        {{ publication.country_name }} · {{ publication.issues.length }} issues
+        {{ publication.country_name }} ·
+        <template v-if="publication.years && publication.years.length">
+          {{ publication.issues.length }} issues in {{ publication.selected_year }}
+          ({{ publication.total_issues }} across all years)
+        </template>
+        <template v-else>
+          {{ publication.total_issues || publication.issues.length }} issues
+        </template>
         <span v-if="filter !== 'all'" class="text-slate-400">
-          (showing {{ filteredIssues.length }} {{ filter }})
+          · showing {{ filteredIssues.length }} {{ filter }}
         </span>
       </p>
+
+      <!-- Year tabs — only shown for very long runs with year data -->
+      <div v-if="publication.years && publication.years.length"
+           class="flex flex-wrap gap-1 mb-4">
+        <a v-for="y in publication.years" :key="y.year"
+           :href="'#/publication/'+encodeURIComponent(publication.publicationcode)+'?year='+y.year"
+           class="inline-flex items-center gap-1 px-2.5 py-1 rounded text-sm border transition"
+           :class="y.year === publication.selected_year
+             ? 'bg-blue-600 text-white border-blue-600'
+             : 'bg-white text-slate-700 border-slate-200 hover:border-blue-400'">
+          <span>{{ y.year }}</span>
+          <span class="text-xs opacity-75">{{ y.count }}</span>
+        </a>
+      </div>
 
       <!-- Bulk add toolbar -->
       <div class="bg-white border rounded-lg p-3 mb-3 flex flex-wrap items-center gap-3 text-sm">
@@ -456,6 +477,104 @@
         </div>
       </div>
 
+      <!-- GCD imports — non-Disney comics -->
+      <div class="bg-white border rounded-lg p-5 mb-4">
+        <h2 class="font-semibold text-lg mb-1">Imported series (GCD)</h2>
+        <p class="text-slate-600 text-sm mb-3">
+          Search the
+          <a class="text-blue-600 underline" target="_blank" href="https://www.comics.org/">Grand Comics Database</a>
+          to add non-Disney series (Basserne, Beetle Bailey, Splint &amp; Co., …). Imported
+          series appear under their country in <em>Browse</em> alongside the Inducks
+          publications.
+        </p>
+
+        <ul v-if="customPubs.length" class="space-y-1 mb-3">
+          <li v-for="cp in customPubs" :key="cp.id"
+              class="bg-slate-50 border rounded px-3 py-2 text-sm">
+            <div class="flex items-center justify-between gap-3">
+              <div class="min-w-0">
+                <a :href="'#/publication/'+cp.publicationcode"
+                   class="font-medium text-blue-700 hover:underline">{{ cp.title }}</a>
+                <span class="text-slate-500">
+                  · {{ cp.year_began || '?' }}–{{ cp.year_ended || '?' }}
+                  · {{ cp.publisher || cp.countrycode }}
+                  · {{ cp.enriched_count }} / {{ cp.issue_count }} covers
+                </span>
+              </div>
+              <div class="flex gap-3 shrink-0">
+                <button v-if="!cp.enrich_status.running && cp.enriched_count < cp.issue_count"
+                        class="text-blue-600 text-xs hover:underline"
+                        @click="enrichCustomPub(cp)">fetch missing covers</button>
+                <button class="text-red-600 text-xs hover:underline"
+                        @click="deleteCustomPub(cp)">remove</button>
+              </div>
+            </div>
+            <div v-if="cp.enrich_status.running" class="mt-2">
+              <div class="h-1.5 bg-slate-200 rounded overflow-hidden">
+                <div class="h-full bg-emerald-500 transition-all"
+                     :style="{width: cp.enrich_status.total ? (cp.enrich_status.done / cp.enrich_status.total * 100) + '%' : '0%'}"></div>
+              </div>
+              <p class="text-xs text-slate-500 mt-1">
+                Enriching: {{ cp.enrich_status.done }} / {{ cp.enrich_status.total }}
+                <span v-if="cp.enrich_status.errors" class="text-amber-600">
+                  · {{ cp.enrich_status.errors }} failed
+                </span>
+                <span v-if="cp.enrich_status.throttled_seconds" class="text-amber-600">
+                  · throttled by GCD, resuming in {{ cp.enrich_status.throttled_seconds }}s
+                </span>
+              </p>
+            </div>
+          </li>
+        </ul>
+
+        <form @submit.prevent="searchGcd" class="flex gap-2 mb-3">
+          <input v-model="gcdQuery" placeholder="Series name, e.g. Basserne…"
+                 class="border rounded px-3 py-1.5 flex-1" minlength="2" />
+          <button class="bg-blue-600 text-white rounded px-4 hover:bg-blue-700"
+                  :disabled="gcdSearching">
+            {{ gcdSearching ? 'Searching…' : 'Search GCD' }}
+          </button>
+        </form>
+
+        <ul v-if="gcdResults.length" class="space-y-1 max-h-72 overflow-auto border rounded">
+          <li v-for="r in gcdResults" :key="r.id"
+              class="flex items-center justify-between px-3 py-2 text-sm border-b last:border-b-0">
+            <div class="min-w-0">
+              <span class="font-medium">{{ r.name }}</span>
+              <span class="text-slate-500">
+                · {{ r.country }} · {{ r.year_began || '?' }}–{{ r.year_ended || '?' }}
+                · {{ r.issue_count }} issues
+              </span>
+            </div>
+            <button class="bg-emerald-600 text-white rounded px-3 py-1 text-xs hover:bg-emerald-700 shrink-0"
+                    :disabled="gcdImporting === r.id"
+                    @click="importGcd(r)">
+              {{ gcdImporting === r.id ? 'Importing…' : 'Import' }}
+            </button>
+          </li>
+        </ul>
+        <p v-else-if="gcdSearchedOnce && !gcdSearching" class="text-slate-500 text-sm italic">
+          No matches.
+        </p>
+      </div>
+
+      <!-- Display options -->
+      <div class="bg-white border rounded-lg p-5 mb-4">
+        <h2 class="font-semibold text-lg mb-1">Display options</h2>
+        <p class="text-slate-600 text-sm mb-3">
+          Long publications (over the threshold below) are split into year tabs
+          on the publication page so they load quickly.
+        </p>
+        <label class="flex items-center gap-3 text-sm">
+          <span class="font-medium">Split into year tabs at</span>
+          <input v-model.number="appSettings.year_pagination_threshold"
+                 type="number" min="1" step="50"
+                 class="border rounded px-3 py-1.5 w-28"
+                 @change="saveAppSettings" />
+          <span class="text-slate-500">issues</span>
+        </label>
+      </div>
+
       <!-- Locations -->
       <div class="bg-white border rounded-lg p-5 mb-4">
         <h2 class="font-semibold text-lg mb-1">Locations</h2>
@@ -532,6 +651,15 @@ createApp({
     const newLocation   = ref('');
     const newCondition  = ref('');
     const searchResults = ref(null);
+    const appSettings   = reactive({ year_pagination_threshold: 500 });
+
+    // GCD import UI state
+    const gcdQuery         = ref('');
+    const gcdResults       = ref([]);
+    const gcdSearching     = ref(false);
+    const gcdSearchedOnce  = ref(false);
+    const gcdImporting     = ref(null);
+    const customPubs       = ref([]);
 
     const loginForm = reactive({ username: '', password: '' });
     const loginError = ref('');
@@ -568,7 +696,7 @@ createApp({
       if (!parts.length)                 return { name: 'countries' };
       if (parts[0] === 'setup')          return { name: 'setup' };
       if (parts[0] === 'country')        return { name: 'country', code: decodeURIComponent(parts[1] || '') };
-      if (parts[0] === 'publication')    return { name: 'publication', code: decodeURIComponent(parts.slice(1).join('/')) };
+      if (parts[0] === 'publication')    return { name: 'publication', code: decodeURIComponent(parts.slice(1).join('/')), year: qs.get('year') || null };
       if (parts[0] === 'issue')          return { name: 'issue', code: decodeURIComponent(parts.slice(1).join('/')) };
       if (parts[0] === 'search')         return { name: 'search', q: qs.get('q') || '' };
       if (parts[0] === 'collection')     return { name: 'collection' };
@@ -579,7 +707,7 @@ createApp({
 
     const reload = async () => {
       const r = parseHash();
-      Object.assign(route, { name: r.name, code: r.code || null, q: r.q || null });
+      Object.assign(route, { name: r.name, code: r.code || null, q: r.q || null, year: r.year || null });
       // Clear previous detail-view data immediately so the stale issue/publication
       // doesn't linger while the next fetch is in flight.
       if (route.name === 'issue')         issue.value = null;
@@ -600,7 +728,9 @@ createApp({
           publications.value = data.items;
           pubTotal.value = data.total;
         } else if (route.name === 'publication') {
-          publication.value = await J(`/api/publications/${encodeURIComponent(route.code)}`);
+          const url = `/api/publications/${encodeURIComponent(route.code)}` +
+                      (route.year ? `?year=${encodeURIComponent(route.year)}` : '');
+          publication.value = await J(url);
           await ensureLocations();
           await ensureConditions();
         } else if (route.name === 'issue') {
@@ -615,6 +745,8 @@ createApp({
         } else if (route.name === 'locations' || route.name === 'settings') {
           await ensureLocations();
           await ensureConditions(true);
+          Object.assign(appSettings, await J('/api/app-settings'));
+          customPubs.value = await J('/api/custom-publications');
         }
       } catch (e) {
         console.error(e);
@@ -683,6 +815,75 @@ createApp({
     };
     const ensureConditions = async (force = false) => {
       if (force || !conditions.value.length) conditions.value = await J('/api/conditions');
+    };
+
+    const searchGcd = async () => {
+      const q = gcdQuery.value.trim();
+      if (q.length < 2) return;
+      gcdSearching.value = true;
+      gcdSearchedOnce.value = true;
+      try {
+        gcdResults.value = await J('/api/gcd/search?q=' + encodeURIComponent(q));
+      } catch (e) {
+        alert(e.message);
+        gcdResults.value = [];
+      } finally {
+        gcdSearching.value = false;
+      }
+    };
+
+    const importGcd = async (r) => {
+      gcdImporting.value = r.id;
+      try {
+        await J('/api/custom-publications/import-gcd', {
+          method: 'POST',
+          body: JSON.stringify({ series_id: r.id }),
+        });
+        customPubs.value = await J('/api/custom-publications');
+        gcdResults.value = gcdResults.value.filter(x => x.id !== r.id);
+      } catch (e) {
+        alert(e.message);
+      } finally {
+        gcdImporting.value = null;
+      }
+    };
+
+    const deleteCustomPub = async (cp) => {
+      if (!confirm(`Remove "${cp.title}" and any owned copies of its issues?`)) return;
+      await J(`/api/custom-publications/${cp.id}`, { method: 'DELETE' });
+      customPubs.value = await J('/api/custom-publications');
+    };
+
+    const enrichCustomPub = async (cp) => {
+      try {
+        await J(`/api/custom-publications/${cp.id}/enrich`, { method: 'POST' });
+        customPubs.value = await J('/api/custom-publications');
+      } catch (e) { alert(e.message); }
+    };
+
+    // Poll enrichment progress while any custom pub is busy.
+    let _enrichTimer = null;
+    watch(customPubs, (list) => {
+      const anyRunning = list.some(cp => cp.enrich_status?.running);
+      if (anyRunning && !_enrichTimer) {
+        _enrichTimer = setInterval(async () => {
+          try {
+            customPubs.value = await J('/api/custom-publications');
+          } catch {}
+        }, 3000);
+      } else if (!anyRunning && _enrichTimer) {
+        clearInterval(_enrichTimer);
+        _enrichTimer = null;
+      }
+    }, { deep: true });
+
+    const saveAppSettings = async () => {
+      try {
+        await J('/api/app-settings', {
+          method: 'PATCH',
+          body: JSON.stringify(appSettings),
+        });
+      } catch (e) { alert(e.message); }
     };
 
     const addCondition = async () => {
@@ -804,6 +1005,9 @@ createApp({
       filter, filteredIssues, searchInput,
       countries, publications, pubTotal, publication, issue, collection,
       locations, conditions, newLocation, newCondition, searchResults,
+      appSettings, saveAppSettings,
+      gcdQuery, gcdResults, gcdSearching, gcdSearchedOnce, gcdImporting,
+      customPubs, searchGcd, importGcd, deleteCustomPub, enrichCustomPub,
       loginForm, loginError, showLoginForm,
       countryHeading,
       doLogin, logout, startSync,

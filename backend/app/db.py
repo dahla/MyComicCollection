@@ -48,6 +48,42 @@ def init_collection_tables() -> None:
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_ci_issuecode ON collection_item(issuecode)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS app_setting (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        # Non-Inducks publications (e.g. imported from the Grand Comics Database).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS custom_publication (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,           -- 'gcd' or 'manual'
+                source_id TEXT,                 -- GCD series id, NULL for manual
+                title TEXT NOT NULL,
+                countrycode TEXT,
+                languagecode TEXT,
+                publisher TEXT,
+                year_began INTEGER,
+                year_ended INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source, source_id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS custom_issue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                publication_id INTEGER NOT NULL
+                    REFERENCES custom_publication(id) ON DELETE CASCADE,
+                source_id TEXT,
+                issuenumber TEXT,
+                title TEXT,
+                oldestdate TEXT,
+                cover_url TEXT,
+                position INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_custom_issue_pub ON custom_issue(publication_id)")
 
         # Seed default conditions on first run
         if c.execute("SELECT COUNT(*) FROM collection_condition").fetchone()[0] == 0:
