@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ComicVault</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    .cover-fallback{
+      background: repeating-linear-gradient(45deg,#f3f4f6,#f3f4f6 8px,#e5e7eb 8px,#e5e7eb 16px);
+    }
+    [v-cloak]{display:none}
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+<div id="app" v-cloak>
+
+  <!-- ---------- header ---------- -->
+  <header class="sticky top-0 z-20 bg-white border-b">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+      <a href="#/" class="font-bold text-lg shrink-0">📚 ComicVault</a>
+      <nav class="hidden md:flex gap-3 text-sm text-slate-600">
+        <a href="#/" class="hover:text-slate-900">Browse</a>
+        <a href="#/collection" class="hover:text-slate-900">Collection</a>
+        <a href="#/settings" class="hover:text-slate-900">Settings</a>
+      </nav>
+      <div class="flex-1"></div>
+      <input
+        v-model="searchInput"
+        @keydown.enter="doSearch"
+        type="search" placeholder="Search publications & stories…"
+        class="border rounded px-3 py-1.5 text-sm w-64 focus:outline-none focus:ring focus:ring-blue-200"
+      />
+      <select v-model="filter"
+              class="border rounded px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring focus:ring-blue-200">
+        <option value="all">All</option>
+        <option value="owned">Owned only</option>
+        <option value="missing">Missing only</option>
+      </select>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6">
+
+    <!-- ---------- setup / sync gate ---------- -->
+    <section v-if="route.name === 'setup' || (!setup.synced && route.name !== 'sync')">
+      <h1 class="text-2xl font-bold mb-4">Welcome to ComicVault</h1>
+      <p class="text-slate-700 mb-6">
+        Before you can browse comics you need to (1) provide your free
+        <a class="text-blue-600 underline" target="_blank" href="https://inducks.org/login.php">inducks.org</a>
+        login (used to fetch cover images) and (2) download the Inducks catalogue.
+      </p>
+
+      <div class="bg-white border rounded-lg p-5 mb-4">
+        <h2 class="font-semibold mb-3">1. Inducks credentials</h2>
+        <p v-if="setup.logged_in" class="text-emerald-700 mb-2">
+          ✓ Already logged in.
+          <button class="text-sm text-slate-500 underline ml-2" @click="logout">log out</button>
+        </p>
+        <form v-else class="flex flex-col gap-2 max-w-sm" @submit.prevent="doLogin">
+          <input v-model="loginForm.username" placeholder="username" class="border rounded px-3 py-1.5" required />
+          <input v-model="loginForm.password" placeholder="password" type="password" class="border rounded px-3 py-1.5" required />
+          <button class="bg-blue-600 text-white rounded py-2 hover:bg-blue-700">Log in</button>
+          <p v-if="loginError" class="text-red-600 text-sm">{{ loginError }}</p>
+        </form>
+      </div>
+
+      <div class="bg-white border rounded-lg p-5">
+        <h2 class="font-semibold mb-3">2. Inducks catalogue</h2>
+        <p v-if="setup.synced" class="text-emerald-700 mb-2">✓ Catalogue is loaded.</p>
+        <p v-else class="text-slate-700 mb-2">
+          The Inducks catalogue (~100 MB compressed) will be downloaded and
+          imported. This takes a few minutes.
+        </p>
+        <button class="bg-emerald-600 text-white rounded px-4 py-2 hover:bg-emerald-700"
+                :disabled="syncing"
+                @click="startSync">
+          {{ setup.synced ? 'Re-sync catalogue' : 'Download catalogue' }}
+        </button>
+        <div v-if="syncing || sync.status !== 'idle'" class="mt-4">
+          <div class="h-2 bg-slate-200 rounded overflow-hidden">
+            <div class="h-full bg-emerald-500 transition-all" :style="{width: (sync.percent||0)+'%'}"></div>
+          </div>
+          <p class="text-sm text-slate-700 mt-1">
+            <span class="font-mono uppercase text-xs text-slate-500">{{ sync.status }}</span>
+            — {{ sync.detail }}
+          </p>
+          <p v-if="sync.error" class="text-red-600 text-sm">{{ sync.error }}</p>
+        </div>
+        <p v-if="setup.synced" class="mt-4">
+          <a href="#/" class="text-blue-600 underline">Continue to browse →</a>
+        </p>
+      </div>
+    </section>
+
+    <!-- ---------- countries ---------- -->
+    <section v-else-if="route.name === 'countries'">
+      <h1 class="text-2xl font-bold mb-4">Browse by country</h1>
+      <div v-if="loading" class="text-slate-500">Loading…</div>
+      <ul v-else class="grid gap-2 sm:grid-cols-2 md:grid-cols-3">
+        <li v-for="c in countries" :key="c.code">
+          <a :href="'#/country/'+c.code"
+             class="block bg-white border rounded-lg px-4 py-3 hover:border-blue-400">
+            <span class="font-medium">{{ c.name }}</span>
+            <span class="text-slate-500 text-sm float-right">{{ c.count }}</span>
+          </a>
+        </li>
+      </ul>
+      <p v-if="!loading && !countries.length" class="text-slate-500">
+        No publications match the current filter.
+      </p>
+    </section>
+
+    <!-- ---------- publications grid ---------- -->
+    <section v-else-if="route.name === 'country' || route.name === 'all-pubs'">
+      <nav class="flex items-center gap-1.5 text-sm mb-2 flex-wrap">
+        <a href="#/" class="text-slate-500 hover:text-slate-900">Browse</a>
+        <span class="text-slate-300">›</span>
+        <span class="text-slate-900 font-medium">{{ countryHeading }}</span>
+      </nav>
+      <h1 class="text-2xl font-bold mb-4">{{ countryHeading }}</h1>
+      <div v-if="loading" class="text-slate-500">Loading…</div>
+      <div v-else>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+          <a v-for="p in publications" :key="p.publicationcode"
+             :href="'#/publication/'+encodeURIComponent(p.publicationcode)"
+             class="block bg-white border rounded hover:border-blue-400 p-2 text-xs">
+            <div class="aspect-[3/4] mb-1 overflow-hidden rounded cover-fallback">
+              <img loading="lazy"
+                   :src="'/api/covers/publication/'+encodeURIComponent(p.publicationcode)"
+                   class="w-full h-full object-cover"
+                   @error="$event.target.style.display='none'" />
+            </div>
+            <div class="font-medium truncate" :title="p.title">{{ p.title }}</div>
+            <div class="text-slate-500 flex justify-between">
+              <span>{{ p.publicationcode }}</span>
+              <span v-if="p.owned_count" class="text-emerald-600">★ {{ p.owned_count }}</span>
+            </div>
+          </a>
+        </div>
+        <div v-if="pubTotal > publications.length" class="mt-4 text-center">
+          <button @click="loadMorePublications" class="text-blue-600 underline text-sm">
+            Load more ({{ publications.length }} / {{ pubTotal }})
+          </button>
+        </div>
+        <p v-if="!publications.length" class="text-slate-500">No publications found.</p>
+      </div>
+    </section>
+
+    <!-- ---------- publication detail loading skeleton ---------- -->
+    <section v-else-if="route.name === 'publication' && !publication" class="animate-pulse">
+      <div class="h-3 w-48 bg-slate-200 rounded mb-3"></div>
+      <div class="h-7 w-72 bg-slate-200 rounded mb-2"></div>
+      <div class="h-3 w-40 bg-slate-200 rounded mb-6"></div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-3">
+        <div v-for="n in 24" :key="n" class="aspect-[3/4] cover-fallback rounded"></div>
+      </div>
+    </section>
+
+    <!-- ---------- publication detail (issue grid) ---------- -->
+    <section v-else-if="route.name === 'publication' && publication">
+      <nav class="flex items-center gap-1.5 text-sm mb-2 flex-wrap">
+        <a href="#/" class="text-slate-500 hover:text-slate-900">Browse</a>
+        <span class="text-slate-300">›</span>
+        <a v-if="publication.countrycode"
+           :href="'#/country/'+publication.countrycode"
+           class="text-slate-500 hover:text-slate-900">{{ publication.country_name || publication.countrycode }}</a>
+        <span class="text-slate-300">›</span>
+        <span class="text-slate-900 font-medium truncate">{{ publication.title }}</span>
+      </nav>
+      <h1 class="text-2xl font-bold">{{ publication.title }}</h1>
+      <p class="text-slate-500 text-sm mb-4">
+        {{ publication.country_name }} · {{ publication.issues.length }} issues
+        <span v-if="filter !== 'all'" class="text-slate-400">
+          (showing {{ filteredIssues.length }} {{ filter }})
+        </span>
+      </p>
+
+      <!-- Bulk add toolbar -->
+      <div class="bg-white border rounded-lg p-3 mb-3 flex flex-wrap items-center gap-3 text-sm">
+        <label class="flex items-center gap-1.5 cursor-pointer select-none">
+          <input type="checkbox" v-model="bulkMode" />
+          <span class="font-medium">Bulk add mode</span>
+        </label>
+        <template v-if="bulkMode">
+          <span class="text-slate-300">|</span>
+          <select v-model="bulkLocationId" class="border rounded px-2 py-1">
+            <option :value="null">(no location)</option>
+            <option v-for="l in locations" :value="l.id" :key="l.id">{{ l.name }}</option>
+          </select>
+          <select v-model="bulkCondition" class="border rounded px-2 py-1">
+            <option :value="null">(no grade)</option>
+            <option v-for="c in conditions" :value="c.name" :key="c.id">{{ c.name }}</option>
+          </select>
+          <span class="text-slate-500 text-xs italic">click an issue to mark it owned</span>
+        </template>
+      </div>
+
+      <p v-if="!filteredIssues.length" class="text-slate-500 text-sm">
+        No {{ filter === 'owned' ? 'owned' : filter === 'missing' ? 'missing' : '' }} issues in this publication.
+      </p>
+      <div class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-3">
+        <a v-for="i in filteredIssues" :key="i.issuecode"
+           :href="'#/issue/'+encodeURIComponent(i.issuecode)"
+           @click="onIssueClick($event, i)"
+           class="block bg-white border rounded hover:border-blue-400 p-1.5 text-xs"
+           :class="[
+             i.owned.length ? 'border-emerald-400 ring-1 ring-emerald-200' : '',
+             bulkMode ? 'cursor-copy' : ''
+           ]">
+          <div class="aspect-[3/4] mb-1 overflow-hidden rounded cover-fallback">
+            <img loading="lazy"
+                 :src="'/api/covers/issue/'+encodeURIComponent(i.issuecode)"
+                 class="w-full h-full object-cover"
+                 @error="$event.target.style.display='none'" />
+          </div>
+          <div class="font-medium truncate">#{{ i.issuenumber }}</div>
+          <div class="text-slate-500 truncate flex justify-between">
+            <span>{{ (i.oldestdate||'').slice(0,4) }}</span>
+            <span v-if="i.owned.length" class="text-emerald-600">★{{ i.owned.length }}</span>
+          </div>
+        </a>
+      </div>
+    </section>
+
+    <!-- ---------- issue detail loading skeleton ---------- -->
+    <section v-else-if="route.name === 'issue' && !issue" class="animate-pulse">
+      <div class="h-3 w-64 bg-slate-200 rounded mb-3"></div>
+      <div class="h-7 w-80 bg-slate-200 rounded mb-2"></div>
+      <div class="h-3 w-32 bg-slate-200 rounded mb-6"></div>
+      <div class="grid md:grid-cols-3 gap-6">
+        <div class="md:col-span-1 aspect-[3/4] cover-fallback rounded"></div>
+        <div class="md:col-span-2 space-y-4">
+          <div class="h-32 bg-slate-200 rounded"></div>
+          <div class="h-48 bg-slate-200 rounded"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- issue detail ---------- -->
+    <section v-else-if="route.name === 'issue' && issue">
+      <nav class="flex items-center gap-1.5 text-sm mb-2 flex-wrap">
+        <a href="#/" class="text-slate-500 hover:text-slate-900">Browse</a>
+        <span class="text-slate-300">›</span>
+        <a v-if="issue.countrycode"
+           :href="'#/country/'+issue.countrycode"
+           class="text-slate-500 hover:text-slate-900">{{ issue.country_name || issue.countrycode }}</a>
+        <span v-if="issue.countrycode" class="text-slate-300">›</span>
+        <a :href="'#/publication/'+encodeURIComponent(issue.publicationcode)"
+           class="text-slate-500 hover:text-slate-900 truncate">{{ issue.publication_title }}</a>
+        <span class="text-slate-300">›</span>
+        <span class="text-slate-900 font-medium">#{{ issue.issuenumber }}</span>
+      </nav>
+      <h1 class="text-2xl font-bold">{{ issue.publication_title }} #{{ issue.issuenumber }}</h1>
+      <p class="text-slate-500 text-sm mb-4">{{ issue.oldestdate }}</p>
+
+      <div class="grid md:grid-cols-3 gap-6">
+        <div class="md:col-span-1">
+          <div class="aspect-[3/4] rounded overflow-hidden cover-fallback">
+            <img loading="lazy"
+                 :src="'/api/covers/issue/'+encodeURIComponent(issue.issuecode)"
+                 class="w-full h-full object-cover"
+                 @error="$event.target.style.display='none'" />
+          </div>
+        </div>
+
+        <div class="md:col-span-2 space-y-4">
+          <!-- ownership panel -->
+          <div class="bg-white border rounded-lg p-4">
+            <h2 class="font-semibold mb-2">My copies</h2>
+            <ul class="space-y-2 mb-3" v-if="issue.owned.length">
+              <li v-for="o in issue.owned" :key="o.id"
+                  class="flex flex-wrap items-center gap-2 text-sm">
+                <select :value="o.location_id" @change="updateCopy(o, 'location_id', $event.target.value)"
+                        class="border rounded px-2 py-1">
+                  <option value="">(no location)</option>
+                  <option v-for="l in locations" :value="l.id" :key="l.id">{{ l.name }}</option>
+                </select>
+                <select :value="o.condition" @change="updateCopy(o, 'condition', $event.target.value)"
+                        class="border rounded px-2 py-1">
+                  <option value="">(no grade)</option>
+                  <option v-for="c in conditions" :value="c.name" :key="c.id">{{ c.name }}</option>
+                </select>
+                <input :value="o.notes" placeholder="notes" class="border rounded px-2 py-1 flex-1 min-w-32"
+                       @change="updateCopy(o, 'notes', $event.target.value)" />
+                <button class="text-red-600 text-xs hover:underline" @click="deleteCopy(o)">remove</button>
+              </li>
+            </ul>
+            <p v-else class="text-slate-500 text-sm mb-3">You don't own a copy of this issue yet.</p>
+            <button class="bg-emerald-600 text-white rounded px-3 py-1.5 text-sm hover:bg-emerald-700"
+                    @click="addCopy(issue)">+ Add a copy</button>
+          </div>
+
+          <!-- stories -->
+          <div class="bg-white border rounded-lg p-4">
+            <h2 class="font-semibold mb-2">Stories</h2>
+            <ol class="list-decimal pl-6 space-y-1 text-sm" v-if="issue.stories.length">
+              <li v-for="s in issue.stories" :key="s.position">
+                {{ s.title || s.original_title || '(untitled)' }}
+                <span v-if="s.original_title && s.original_title !== s.title"
+                      class="text-slate-500">— {{ s.original_title }}</span>
+              </li>
+            </ol>
+            <p v-else class="text-slate-500 text-sm">No story listing.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- search results ---------- -->
+    <section v-else-if="route.name === 'search'">
+      <h1 class="text-2xl font-bold mb-4">Search results for "{{ route.q }}"</h1>
+      <div v-if="loading" class="text-slate-500">Searching…</div>
+      <div v-else-if="searchResults" class="space-y-6">
+        <div v-if="searchResults.publications.length">
+          <h2 class="font-semibold mb-2">Publications</h2>
+          <ul class="space-y-1 text-sm">
+            <li v-for="p in searchResults.publications" :key="p.publicationcode">
+              <a :href="'#/publication/'+encodeURIComponent(p.publicationcode)"
+                 class="text-blue-600 underline">{{ p.title }}</a>
+              <span class="text-slate-500"> ({{ p.countrycode }})</span>
+            </li>
+          </ul>
+        </div>
+        <div v-if="searchResults.issues.length">
+          <h2 class="font-semibold mb-2">Issues</h2>
+          <ul class="space-y-1 text-sm">
+            <li v-for="i in searchResults.issues" :key="i.issuecode">
+              <a :href="'#/issue/'+encodeURIComponent(i.issuecode)" class="text-blue-600 underline">
+                {{ i.pub_title }} #{{ i.issuenumber }}
+              </a>
+              <span v-if="i.title" class="text-slate-700"> — {{ i.title }}</span>
+            </li>
+          </ul>
+        </div>
+        <div v-if="searchResults.stories.length">
+          <h2 class="font-semibold mb-2">Stories</h2>
+          <ul class="space-y-1 text-sm">
+            <li v-for="s in searchResults.stories" :key="s.storycode">
+              <a v-if="s.issuecode" :href="'#/issue/'+encodeURIComponent(s.issuecode)"
+                 class="text-blue-600 underline">{{ s.title }}</a>
+              <span v-else>{{ s.title }}</span>
+              <span v-if="s.pub_title" class="text-slate-500"> ({{ s.pub_title }})</span>
+            </li>
+          </ul>
+        </div>
+        <p v-if="!searchResults.publications.length && !searchResults.issues.length && !searchResults.stories.length"
+           class="text-slate-500">No matches.</p>
+      </div>
+    </section>
+
+    <!-- ---------- collection ---------- -->
+    <section v-else-if="route.name === 'collection'">
+      <h1 class="text-2xl font-bold mb-4">My collection</h1>
+      <p v-if="!collection.length" class="text-slate-500">
+        Nothing here yet. Browse a publication and add a copy of an issue.
+      </p>
+      <table v-else class="w-full text-sm bg-white border rounded">
+        <thead class="bg-slate-100 text-left">
+          <tr>
+            <th class="p-2">Publication</th>
+            <th class="p-2">Issue</th>
+            <th class="p-2">Location</th>
+            <th class="p-2">Condition</th>
+            <th class="p-2">Notes</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="o in collection" :key="o.id" class="border-t">
+            <td class="p-2">{{ o.publication_title }}</td>
+            <td class="p-2">
+              <a :href="'#/issue/'+encodeURIComponent(o.issuecode)" class="text-blue-600 underline">
+                #{{ o.issuenumber }}
+              </a>
+            </td>
+            <td class="p-2">{{ o.location_name || '—' }}</td>
+            <td class="p-2">{{ o.condition || '—' }}</td>
+            <td class="p-2">{{ o.notes }}</td>
+            <td class="p-2 text-right">
+              <button class="text-red-600 hover:underline" @click="deleteCopy(o, true)">remove</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ---------- settings (consolidated) ---------- -->
+    <section v-else-if="route.name === 'settings' || route.name === 'locations'">
+      <h1 class="text-2xl font-bold mb-6">Settings</h1>
+
+      <!-- Inducks credentials -->
+      <div class="bg-white border rounded-lg p-5 mb-4">
+        <h2 class="font-semibold text-lg mb-3">Inducks account</h2>
+        <p class="text-slate-600 text-sm mb-3">
+          Used to fetch cover images from inducks.org.
+        </p>
+        <div v-if="setup.logged_in" class="flex items-center gap-3 text-sm">
+          <span class="inline-flex items-center gap-1 text-emerald-700">
+            <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+            Logged in
+          </span>
+          <button class="text-slate-600 hover:text-slate-900 underline" @click="logout">Log out</button>
+          <button class="text-blue-600 hover:text-blue-800 underline"
+                  @click="showLoginForm = !showLoginForm">
+            {{ showLoginForm ? 'Cancel' : 'Change credentials' }}
+          </button>
+        </div>
+        <div v-else class="text-sm mb-2">
+          <span class="inline-flex items-center gap-1 text-amber-700">
+            <span class="w-2 h-2 rounded-full bg-amber-500"></span>
+            Not logged in
+          </span>
+        </div>
+        <form v-if="!setup.logged_in || showLoginForm"
+              class="flex flex-col gap-2 max-w-sm mt-3" @submit.prevent="doLogin">
+          <input v-model="loginForm.username" placeholder="username"
+                 class="border rounded px-3 py-1.5" required />
+          <input v-model="loginForm.password" placeholder="password"
+                 type="password" class="border rounded px-3 py-1.5" required />
+          <button class="bg-blue-600 text-white rounded py-2 hover:bg-blue-700">
+            {{ setup.logged_in ? 'Update credentials' : 'Log in' }}
+          </button>
+          <p v-if="loginError" class="text-red-600 text-sm">{{ loginError }}</p>
+        </form>
+      </div>
+
+      <!-- Catalogue -->
+      <div class="bg-white border rounded-lg p-5 mb-4">
+        <h2 class="font-semibold text-lg mb-3">Catalogue</h2>
+        <p class="text-sm mb-3">
+          <span v-if="setup.synced" class="inline-flex items-center gap-1 text-emerald-700">
+            <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+            Loaded
+          </span>
+          <span v-else class="inline-flex items-center gap-1 text-amber-700">
+            <span class="w-2 h-2 rounded-full bg-amber-500"></span>
+            Not loaded
+          </span>
+        </p>
+        <button class="bg-blue-600 text-white rounded px-4 py-1.5 text-sm hover:bg-blue-700"
+                :disabled="syncing"
+                @click="startSync">
+          {{ setup.synced ? 'Re-sync from inducks.org' : 'Download catalogue' }}
+        </button>
+        <div v-if="syncing || (sync.status !== 'idle' && sync.status !== 'done')" class="mt-3">
+          <div class="h-2 bg-slate-200 rounded overflow-hidden">
+            <div class="h-full bg-emerald-500 transition-all" :style="{width: (sync.percent||0)+'%'}"></div>
+          </div>
+          <p class="text-sm text-slate-700 mt-1">
+            <span class="font-mono uppercase text-xs text-slate-500">{{ sync.status }}</span>
+            — {{ sync.detail }}
+          </p>
+          <p v-if="sync.error" class="text-red-600 text-sm">{{ sync.error }}</p>
+        </div>
+      </div>
+
+      <!-- Locations -->
+      <div class="bg-white border rounded-lg p-5 mb-4">
+        <h2 class="font-semibold text-lg mb-1">Locations</h2>
+        <p class="text-slate-600 text-sm mb-3">
+          Where you store your comics — e.g. "Living room shelf", "Box A in attic".
+        </p>
+        <form @submit.prevent="addLocation" class="flex gap-2 mb-3">
+          <input v-model="newLocation" placeholder="New location name…"
+                 class="border rounded px-3 py-1.5 flex-1" />
+          <button class="bg-blue-600 text-white rounded px-4 hover:bg-blue-700">Add</button>
+        </form>
+        <ul class="space-y-1">
+          <li v-for="l in locations" :key="l.id"
+              class="flex justify-between items-center bg-slate-50 border rounded px-3 py-2 text-sm">
+            <span>{{ l.name }}</span>
+            <button class="text-red-600 hover:underline text-xs" @click="deleteLocation(l)">delete</button>
+          </li>
+          <li v-if="!locations.length" class="text-slate-500 text-sm italic">No locations yet.</li>
+        </ul>
+      </div>
+
+      <!-- Conditions -->
+      <div class="bg-white border rounded-lg p-5">
+        <h2 class="font-semibold text-lg mb-1">Conditions</h2>
+        <p class="text-slate-600 text-sm mb-3">
+          Grades you can pick from when marking a copy. Defaults are pre-seeded; edit as you like.
+        </p>
+        <form @submit.prevent="addCondition" class="flex gap-2 mb-3">
+          <input v-model="newCondition" placeholder="New condition name…"
+                 class="border rounded px-3 py-1.5 flex-1" />
+          <button class="bg-blue-600 text-white rounded px-4 hover:bg-blue-700">Add</button>
+        </form>
+        <ul class="space-y-1">
+          <li v-for="c in conditions" :key="c.id"
+              class="flex justify-between items-center bg-slate-50 border rounded px-3 py-2 text-sm">
+            <span>{{ c.name }}</span>
+            <button class="text-red-600 hover:underline text-xs" @click="deleteCondition(c)">delete</button>
+          </li>
+          <li v-if="!conditions.length" class="text-slate-500 text-sm italic">No conditions yet.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+const { createApp, reactive, ref, computed, onMounted, watch } = Vue;
+
+createApp({
+  setup() {
+    const route = reactive({ name: 'countries', code: null, q: null });
+    const setup = reactive({ synced: false, logged_in: false });
+    const sync  = reactive({ status: 'idle', detail: '', percent: 0, error: null });
+    const loading = ref(false);
+    const filter = ref(localStorage.getItem('filter') || 'all');
+    watch(filter, v => { localStorage.setItem('filter', v); reload(); });
+
+    // Defaults applied to new copies, remembered across reloads
+    const lastLocationId = ref(Number(localStorage.getItem('last_location_id')) || null);
+    const lastCondition  = ref(localStorage.getItem('last_condition') || null);
+
+    const searchInput = ref('');
+
+    const countries     = ref([]);
+    const publications  = ref([]);
+    const pubTotal      = ref(0);
+    const pubOffset     = ref(0);
+    const publication   = ref(null);
+    const issue         = ref(null);
+    const collection    = ref([]);
+    const locations     = ref([]);
+    const conditions    = ref([]);
+    const newLocation   = ref('');
+    const newCondition  = ref('');
+    const searchResults = ref(null);
+
+    const loginForm = reactive({ username: '', password: '' });
+    const loginError = ref('');
+    const showLoginForm = ref(false);
+    const syncing    = ref(false);
+
+    // Bulk add mode (publication detail page)
+    const bulkMode       = ref(false);
+    const bulkLocationId = ref(lastLocationId.value);
+    const bulkCondition  = ref(lastCondition.value);
+
+    const countryHeading = computed(() => {
+      if (route.name !== 'country') return 'All publications';
+      const c = countries.value.find(x => x.code === route.code);
+      return c ? c.name : route.code;
+    });
+
+    // ---- API helpers
+    const J = async (url, opts = {}) => {
+      const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({ detail: r.statusText }));
+        throw new Error(e.detail || 'Request failed');
+      }
+      return r.status === 204 ? null : r.json();
+    };
+
+    // ---- routing
+    const parseHash = () => {
+      const h = window.location.hash.replace(/^#\/?/, '');
+      const [path, query] = h.split('?');
+      const parts = path.split('/').filter(Boolean);
+      const qs = new URLSearchParams(query || '');
+      if (!parts.length)                 return { name: 'countries' };
+      if (parts[0] === 'setup')          return { name: 'setup' };
+      if (parts[0] === 'country')        return { name: 'country', code: decodeURIComponent(parts[1] || '') };
+      if (parts[0] === 'publication')    return { name: 'publication', code: decodeURIComponent(parts.slice(1).join('/')) };
+      if (parts[0] === 'issue')          return { name: 'issue', code: decodeURIComponent(parts.slice(1).join('/')) };
+      if (parts[0] === 'search')         return { name: 'search', q: qs.get('q') || '' };
+      if (parts[0] === 'collection')     return { name: 'collection' };
+      if (parts[0] === 'locations')      return { name: 'locations' };
+      if (parts[0] === 'settings')       return { name: 'settings' };
+      return { name: 'countries' };
+    };
+
+    const reload = async () => {
+      const r = parseHash();
+      Object.assign(route, { name: r.name, code: r.code || null, q: r.q || null });
+      // Clear previous detail-view data immediately so the stale issue/publication
+      // doesn't linger while the next fetch is in flight.
+      if (route.name === 'issue')         issue.value = null;
+      if (route.name === 'publication')   publication.value = null;
+      if (route.name === 'search')        searchResults.value = null;
+      loading.value = true;
+      try {
+        // Always refresh setup status so the gate works correctly
+        await refreshSetup();
+        if (route.name === 'setup' || route.name === 'sync') return;
+        if (!setup.synced) { route.name = 'setup'; return; }
+
+        if (route.name === 'countries') {
+          countries.value = await J(`/api/countries?filter=${filter.value}`);
+        } else if (route.name === 'country') {
+          pubOffset.value = 0;
+          const data = await J(`/api/publications?country=${encodeURIComponent(route.code)}&filter=${filter.value}&limit=120`);
+          publications.value = data.items;
+          pubTotal.value = data.total;
+        } else if (route.name === 'publication') {
+          publication.value = await J(`/api/publications/${encodeURIComponent(route.code)}`);
+          await ensureLocations();
+          await ensureConditions();
+        } else if (route.name === 'issue') {
+          issue.value = await J(`/api/issues/${encodeURIComponent(route.code)}`);
+          await ensureLocations();
+          await ensureConditions();
+        } else if (route.name === 'search') {
+          searchInput.value = route.q;
+          searchResults.value = await J(`/api/search?q=${encodeURIComponent(route.q)}`);
+        } else if (route.name === 'collection') {
+          collection.value = await J('/api/collection');
+        } else if (route.name === 'locations' || route.name === 'settings') {
+          await ensureLocations();
+          await ensureConditions(true);
+        }
+      } catch (e) {
+        console.error(e);
+        alert(e.message);
+      } finally {
+        loading.value = false;
+      }
+    };
+
+    const loadMorePublications = async () => {
+      pubOffset.value += publications.value.length;
+      const data = await J(`/api/publications?country=${encodeURIComponent(route.code)}&filter=${filter.value}&limit=120&offset=${pubOffset.value}`);
+      publications.value = publications.value.concat(data.items);
+    };
+
+    // ---- setup
+    const refreshSetup = async () => {
+      const s = await J('/api/setup');
+      Object.assign(setup, { synced: s.synced, logged_in: s.logged_in });
+      Object.assign(sync, s.sync);
+    };
+
+    const doLogin = async () => {
+      loginError.value = '';
+      try {
+        await J('/api/login', { method: 'POST', body: JSON.stringify(loginForm) });
+        loginForm.password = '';
+        showLoginForm.value = false;
+        await refreshSetup();
+      } catch (e) {
+        loginError.value = e.message;
+      }
+    };
+
+    const logout = async () => {
+      await J('/api/logout', { method: 'POST' });
+      await refreshSetup();
+    };
+
+    const startSync = async () => {
+      try {
+        await J('/api/sync/start', { method: 'POST' });
+        syncing.value = true;
+        pollSync();
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+
+    const pollSync = async () => {
+      try {
+        const s = await J('/api/sync/status');
+        Object.assign(sync, s);
+        if (s.status === 'done' || s.status === 'error') {
+          syncing.value = false;
+          await refreshSetup();
+          return;
+        }
+      } catch {}
+      setTimeout(pollSync, 1500);
+    };
+
+    // ---- collection
+    const ensureLocations = async () => {
+      locations.value = await J('/api/locations');
+    };
+    const ensureConditions = async (force = false) => {
+      if (force || !conditions.value.length) conditions.value = await J('/api/conditions');
+    };
+
+    const addCondition = async () => {
+      const name = newCondition.value.trim();
+      if (!name) return;
+      try {
+        await J('/api/conditions', { method: 'POST', body: JSON.stringify({ name }) });
+        newCondition.value = '';
+        await ensureConditions(true);
+      } catch (e) { alert(e.message); }
+    };
+
+    const deleteCondition = async (c) => {
+      if (!confirm(`Delete "${c.name}"? Existing copies graded "${c.name}" will keep that text.`)) return;
+      await J(`/api/conditions/${c.id}`, { method: 'DELETE' });
+      await ensureConditions(true);
+    };
+
+    const rememberDefault = (field, value) => {
+      if (field === 'location_id') {
+        lastLocationId.value = value;
+        if (value) localStorage.setItem('last_location_id', String(value));
+        else localStorage.removeItem('last_location_id');
+      } else if (field === 'condition') {
+        lastCondition.value = value;
+        if (value) localStorage.setItem('last_condition', value);
+        else localStorage.removeItem('last_condition');
+      }
+    };
+
+    const onIssueClick = (ev, iss) => {
+      if (!bulkMode.value) return;             // normal navigation
+      ev.preventDefault();
+      bulkAdd(iss);
+    };
+
+    const bulkAdd = async (iss) => {
+      const locId = bulkLocationId.value || null;
+      const cond  = bulkCondition.value  || null;
+      const r = await J('/api/collection', {
+        method: 'POST',
+        body: JSON.stringify({ issuecode: iss.issuecode, location_id: locId, condition: cond })
+      });
+      const locName = locId ? (locations.value.find(l => l.id === locId)?.name || null) : null;
+      iss.owned.push({ id: r.id, location_id: locId, location_name: locName, condition: cond, notes: '' });
+      rememberDefault('location_id', locId);
+      rememberDefault('condition',   cond);
+    };
+
+    const addCopy = async (iss) => {
+      // Carry forward the last-used location/condition, but only if they still
+      // exist (the user may have deleted them in Settings since last time).
+      const locId = lastLocationId.value && locations.value.some(l => l.id === lastLocationId.value)
+        ? lastLocationId.value : null;
+      const cond = lastCondition.value && conditions.value.some(c => c.name === lastCondition.value)
+        ? lastCondition.value : null;
+      const r = await J('/api/collection', {
+        method: 'POST',
+        body: JSON.stringify({ issuecode: iss.issuecode, location_id: locId, condition: cond })
+      });
+      const locName = locId ? (locations.value.find(l => l.id === locId)?.name || null) : null;
+      iss.owned.push({ id: r.id, location_id: locId, location_name: locName, condition: cond, notes: '' });
+    };
+
+    const updateCopy = async (o, field, value) => {
+      const body = { [field]: value === '' ? null : (field === 'location_id' ? Number(value) : value) };
+      await J(`/api/collection/${o.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+      o[field] = body[field];
+      if (field === 'location_id') {
+        const loc = locations.value.find(l => l.id === o.location_id);
+        o.location_name = loc ? loc.name : null;
+      }
+      rememberDefault(field, body[field]);
+    };
+
+    const deleteCopy = async (o, fromCollection = false) => {
+      if (!confirm('Remove this copy?')) return;
+      await J(`/api/collection/${o.id}`, { method: 'DELETE' });
+      if (fromCollection) collection.value = collection.value.filter(x => x.id !== o.id);
+      else if (issue.value) issue.value.owned = issue.value.owned.filter(x => x.id !== o.id);
+    };
+
+    const addLocation = async () => {
+      const name = newLocation.value.trim();
+      if (!name) return;
+      try {
+        await J('/api/locations', { method: 'POST', body: JSON.stringify({ name }) });
+        newLocation.value = '';
+        await ensureLocations();
+      } catch (e) { alert(e.message); }
+    };
+
+    const deleteLocation = async (l) => {
+      if (!confirm(`Delete "${l.name}"? Items at this location will lose their location.`)) return;
+      await J(`/api/locations/${l.id}`, { method: 'DELETE' });
+      await ensureLocations();
+    };
+
+    const doSearch = () => {
+      const q = searchInput.value.trim();
+      if (q.length < 2) return;
+      window.location.hash = `#/search?q=${encodeURIComponent(q)}`;
+    };
+
+    onMounted(() => {
+      window.addEventListener('hashchange', reload);
+      reload();
+    });
+
+    const filteredIssues = computed(() => {
+      if (!publication.value) return [];
+      if (filter.value === 'owned')   return publication.value.issues.filter(i => i.owned.length);
+      if (filter.value === 'missing') return publication.value.issues.filter(i => !i.owned.length);
+      return publication.value.issues;
+    });
+
+    return {
+      route, setup, sync, loading, syncing,
+      filter, filteredIssues, searchInput,
+      countries, publications, pubTotal, publication, issue, collection,
+      locations, conditions, newLocation, newCondition, searchResults,
+      loginForm, loginError, showLoginForm,
+      countryHeading,
+      doLogin, logout, startSync,
+      addCopy, updateCopy, deleteCopy,
+      addLocation, deleteLocation,
+      addCondition, deleteCondition,
+      doSearch, loadMorePublications,
+      bulkMode, bulkLocationId, bulkCondition, onIssueClick, bulkAdd,
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

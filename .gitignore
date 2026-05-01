@@ -1,0 +1,20 @@
+# Local data — collection DB, downloaded covers, persisted Inducks session
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+inducks_session.txt
+.inducks_cookies
+
+# Host-specific compose override — contains the NAS path on docker.a-dahl.dk
+docker-compose.override.yml
+
+# Python
+__pycache__/
+*.py[co]
+.venv/
+venv/
+
+# OS junk
+.DS_Store
+Thumbs.db

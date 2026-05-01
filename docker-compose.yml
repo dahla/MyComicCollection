@@ -1,0 +1,11 @@
+services:
+  comicvault:
+    build: .
+    container_name: comicvault
+    restart: unless-stopped
+    ports:
+      - "3111:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      DATA_DIR: /data
