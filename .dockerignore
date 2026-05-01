@@ -1,0 +1,11 @@
+.git
+.github
+data
+__pycache__
+*.py[co]
+.venv
+venv
+docker-compose.override.yml
+*.md
+.gitignore
+.dockerignore
