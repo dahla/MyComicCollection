@@ -11,12 +11,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import gcd, inducks
+from . import auth, gcd, inducks
 from .config import DB_PATH, DEFAULT_YEAR_PAGINATION_THRESHOLD
 from .db import get_conn, has_inducks_data, init_collection_tables
 
@@ -32,6 +32,120 @@ FRONTEND_DIR = _find_frontend()
 app = FastAPI(title="ComicVault")
 
 init_collection_tables()
+
+
+# --------------------------------------------------------------- auth gate
+
+# Endpoints that must be reachable without a session (login flow + status).
+_PUBLIC_ENDPOINTS = {
+    "/api/auth/status",
+    "/api/auth/setup",
+    "/api/auth/login",
+}
+
+
+def _client_ip(request: Request) -> str:
+    """Real client IP (handles X-Forwarded-For from a reverse proxy)."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def require_auth(request: Request, call_next):
+    path = request.url.path
+    # Static frontend (HTML/JS/CSS) is public — the SPA itself decides what
+    # to render based on /api/auth/status. Public auth endpoints obviously
+    # also have to be reachable.
+    if not path.startswith("/api/") or path in _PUBLIC_ENDPOINTS:
+        return await call_next(request)
+    # First-run: no password configured yet → let everything through so the
+    # operator can set one. Once a password is set this branch is closed.
+    if not auth.is_password_set():
+        return await call_next(request)
+    token = request.cookies.get(auth.SESSION_COOKIE)
+    if auth.verify_session(token):
+        return await call_next(request)
+    return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+
+class AuthIn(BaseModel):
+    password: str
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    token = request.cookies.get(auth.SESSION_COOKIE)
+    return {
+        "password_set":   auth.is_password_set(),
+        "authenticated": auth.verify_session(token),
+    }
+
+
+@app.post("/api/auth/setup")
+def auth_setup(body: AuthIn, response: Response):
+    if auth.is_password_set():
+        raise HTTPException(409, "Password already set")
+    try:
+        auth.set_password(body.password)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    token = auth.create_session()
+    response.set_cookie(
+        auth.SESSION_COOKIE, token,
+        httponly=True, samesite="lax",
+        max_age=int(auth.SESSION_TTL.total_seconds()),
+        path="/",
+    )
+    return {"ok": True}
+
+
+@app.post("/api/auth/login")
+def auth_login(body: AuthIn, request: Request, response: Response):
+    ip = _client_ip(request)
+    locked = auth.lockout_seconds(ip)
+    if locked > 0:
+        raise HTTPException(429, f"Too many attempts. Try again in {locked} s.")
+    if not auth.verify_password(body.password):
+        auth.record_failure(ip)
+        # Re-check lockout in case THIS attempt was the one that tripped it.
+        locked = auth.lockout_seconds(ip)
+        if locked > 0:
+            raise HTTPException(429, f"Too many attempts. Locked for {locked} s.")
+        raise HTTPException(401, "Incorrect password")
+    auth.reset_attempts(ip)
+    token = auth.create_session()
+    response.set_cookie(
+        auth.SESSION_COOKIE, token,
+        httponly=True, samesite="lax",
+        max_age=int(auth.SESSION_TTL.total_seconds()),
+        path="/",
+    )
+    return {"ok": True}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response):
+    auth.delete_session(request.cookies.get(auth.SESSION_COOKIE))
+    response.delete_cookie(auth.SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+class ChangePasswordIn(BaseModel):
+    current: str
+    new: str
+
+
+@app.post("/api/auth/change-password")
+def auth_change_password(body: ChangePasswordIn):
+    if not auth.verify_password(body.current):
+        raise HTTPException(401, "Current password is wrong")
+    try:
+        auth.set_password(body.new)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "must_relogin": True}
 
 
 # ----------------------------------------------------------------- setup/sync

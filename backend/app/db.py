@@ -84,6 +84,22 @@ def init_collection_tables() -> None:
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_custom_issue_pub ON custom_issue(publication_id)")
+        # Auth — single-password gate (the password hash itself lives in
+        # app_setting under key 'password_hash').
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS auth_session (
+                token TEXT PRIMARY KEY,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS auth_attempts (
+                ip TEXT PRIMARY KEY,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                locked_until TEXT
+            )
+        """)
 
         # Seed default conditions on first run
         if c.execute("SELECT COUNT(*) FROM collection_condition").fetchone()[0] == 0:

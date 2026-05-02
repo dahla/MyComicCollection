@@ -16,6 +16,39 @@
 <body class="bg-slate-50 text-slate-900">
 <div id="app" v-cloak>
 
+  <!-- ---------- auth gate ---------- -->
+  <div v-if="!authState.checked" class="text-slate-500 text-center py-20 text-sm">
+    Loading…
+  </div>
+
+  <div v-else-if="!authState.authenticated"
+       class="min-h-screen flex items-center justify-center px-4">
+    <div class="w-full max-w-sm bg-white border rounded-lg shadow-sm p-6">
+      <h1 class="font-bold text-xl mb-1">📚 ComicVault</h1>
+      <p v-if="authState.password_set" class="text-slate-500 text-sm mb-4">
+        Enter the password to continue.
+      </p>
+      <p v-else class="text-slate-500 text-sm mb-4">
+        First-time setup — choose a password to lock this site. There's
+        only one password for everyone.
+      </p>
+      <form class="space-y-2"
+            @submit.prevent="authState.password_set ? doLoginGate() : doSetupGate()">
+        <input v-model="authForm.password" type="password" placeholder="Password"
+               required autofocus minlength="4"
+               class="w-full border rounded px-3 py-1.5 focus:outline-none focus:ring focus:ring-blue-200" />
+        <input v-if="!authState.password_set" v-model="authForm.confirm"
+               type="password" placeholder="Confirm password" required minlength="4"
+               class="w-full border rounded px-3 py-1.5 focus:outline-none focus:ring focus:ring-blue-200" />
+        <button class="w-full bg-blue-600 text-white rounded py-2 hover:bg-blue-700">
+          {{ authState.password_set ? 'Log in' : 'Set password' }}
+        </button>
+        <p v-if="authError" class="text-red-600 text-sm text-center">{{ authError }}</p>
+      </form>
+    </div>
+  </div>
+
+  <template v-else>
   <!-- ---------- header ---------- -->
   <header class="sticky top-0 z-20 bg-white border-b">
     <div class="max-w-6xl mx-auto px-3 sm:px-4 py-2 flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -603,6 +636,38 @@
         </p>
       </div>
 
+      <!-- Site password / session -->
+      <div class="bg-white border rounded-lg p-5 mb-4">
+        <h2 class="font-semibold text-lg mb-3">Site security</h2>
+        <p class="text-slate-600 text-sm mb-3">
+          Anyone visiting this site has to enter the site password before
+          they see anything. You can change it here or log out of this
+          session.
+        </p>
+        <div class="flex flex-wrap items-center gap-3 text-sm mb-3">
+          <button class="bg-slate-100 border rounded px-3 py-1.5 hover:bg-slate-200"
+                  @click="doAppLogout">Log out of this session</button>
+        </div>
+        <details class="text-sm">
+          <summary class="cursor-pointer text-blue-700 hover:underline">Change site password</summary>
+          <form class="mt-3 max-w-sm space-y-2" @submit.prevent="submitPasswordChange">
+            <input v-model="passwordChange.current" type="password" placeholder="Current password"
+                   required class="w-full border rounded px-3 py-1.5" />
+            <input v-model="passwordChange.next" type="password" placeholder="New password"
+                   required minlength="4" class="w-full border rounded px-3 py-1.5" />
+            <input v-model="passwordChange.confirm" type="password" placeholder="Confirm new password"
+                   required minlength="4" class="w-full border rounded px-3 py-1.5" />
+            <button class="bg-blue-600 text-white rounded px-4 py-1.5 hover:bg-blue-700">
+              Change password
+            </button>
+            <p v-if="passwordChangeMsg" class="text-sm"
+               :class="passwordChangeMsg.includes('changed') ? 'text-emerald-700' : 'text-red-600'">
+              {{ passwordChangeMsg }}
+            </p>
+          </form>
+        </details>
+      </div>
+
       <!-- Display options -->
       <div class="bg-white border rounded-lg p-5 mb-4">
         <h2 class="font-semibold text-lg mb-1">Display options</h2>
@@ -664,6 +729,7 @@
     </section>
 
   </main>
+  </template>
 </div>
 
 <script>
@@ -671,6 +737,11 @@ const { createApp, reactive, ref, computed, onMounted, watch } = Vue;
 
 createApp({
   setup() {
+    // ---- App-password gate state ----
+    const authState = reactive({ checked: false, password_set: false, authenticated: false });
+    const authForm  = reactive({ password: '', confirm: '' });
+    const authError = ref('');
+
     const route = reactive({ name: 'countries', code: null, q: null });
     const setup = reactive({ synced: false, logged_in: false });
     const sync  = reactive({ status: 'idle', detail: '', percent: 0, error: null });
@@ -729,11 +800,76 @@ createApp({
     // ---- API helpers
     const J = async (url, opts = {}) => {
       const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      if (r.status === 401 && authState.checked) {
+        // Cookie expired or wiped server-side — bounce to gate.
+        authState.authenticated = false;
+        throw new Error('Unauthorized');
+      }
       if (!r.ok) {
         const e = await r.json().catch(() => ({ detail: r.statusText }));
         throw new Error(e.detail || 'Request failed');
       }
       return r.status === 204 ? null : r.json();
+    };
+
+    // ---- App-password gate handlers ----
+    const refreshAuth = async () => {
+      Object.assign(authState, await J('/api/auth/status'), { checked: true });
+    };
+
+    const doLoginGate = async () => {
+      authError.value = '';
+      try {
+        await J('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ password: authForm.password }),
+        });
+        authForm.password = '';
+        await refreshAuth();
+        await reload();
+      } catch (e) { authError.value = e.message; }
+    };
+
+    const doSetupGate = async () => {
+      authError.value = '';
+      if (authForm.password !== authForm.confirm) {
+        authError.value = 'Passwords do not match';
+        return;
+      }
+      try {
+        await J('/api/auth/setup', {
+          method: 'POST',
+          body: JSON.stringify({ password: authForm.password }),
+        });
+        authForm.password = ''; authForm.confirm = '';
+        await refreshAuth();
+        await reload();
+      } catch (e) { authError.value = e.message; }
+    };
+
+    const doAppLogout = async () => {
+      try { await J('/api/auth/logout', { method: 'POST' }); } catch {}
+      authState.authenticated = false;
+    };
+
+    const passwordChange = reactive({ current: '', next: '', confirm: '' });
+    const passwordChangeMsg = ref('');
+    const submitPasswordChange = async () => {
+      passwordChangeMsg.value = '';
+      if (passwordChange.next !== passwordChange.confirm) {
+        passwordChangeMsg.value = 'New passwords do not match';
+        return;
+      }
+      try {
+        await J('/api/auth/change-password', {
+          method: 'POST',
+          body: JSON.stringify({ current: passwordChange.current, new: passwordChange.next }),
+        });
+        passwordChange.current = ''; passwordChange.next = ''; passwordChange.confirm = '';
+        passwordChangeMsg.value = 'Password changed. Please log in again.';
+        // Server invalidated all sessions; cookie is stale.
+        authState.authenticated = false;
+      } catch (e) { passwordChangeMsg.value = e.message; }
     };
 
     // ---- routing
@@ -1053,9 +1189,14 @@ createApp({
       window.location.hash = `#/search?q=${encodeURIComponent(q)}`;
     };
 
-    onMounted(() => {
-      window.addEventListener('hashchange', reload);
-      reload();
+    onMounted(async () => {
+      window.addEventListener('hashchange', () => { if (authState.authenticated) reload(); });
+      try {
+        await refreshAuth();
+      } catch {
+        authState.checked = true;
+      }
+      if (authState.authenticated) reload();
     });
 
     const filteredIssues = computed(() => {
@@ -1075,6 +1216,9 @@ createApp({
       customPubs, searchGcd, importGcd, deleteCustomPub, enrichCustomPub,
       gcdAccount, gcdLoginForm, gcdLoginError, showGcdLoginForm,
       gcdLogin, gcdLogout,
+      authState, authForm, authError,
+      doLoginGate, doSetupGate, doAppLogout,
+      passwordChange, passwordChangeMsg, submitPasswordChange,
       loginForm, loginError, showLoginForm,
       countryHeading,
       doLogin, logout, startSync,
