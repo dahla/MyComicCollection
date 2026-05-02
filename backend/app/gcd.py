@@ -12,6 +12,7 @@ codes whose md5 differs from any real Inducks issuecode.
 """
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -20,8 +21,10 @@ from pathlib import Path
 import httpx
 
 from . import cache
+from .config import DATA_DIR
 
 API_BASE = "https://www.comics.org/api"
+CREDS_FILE = DATA_DIR / "gcd_credentials.json"
 
 # GCD will return 429 if we hammer it. Keep at least this many seconds between
 # successive API calls (image-CDN fetches don't go through here so they aren't
@@ -75,11 +78,48 @@ def _api_get(client: httpx.Client, url: str) -> httpx.Response:
     return last_resp
 
 
+def _load_credentials() -> dict | None:
+    if not CREDS_FILE.exists():
+        return None
+    try:
+        data = json.loads(CREDS_FILE.read_text())
+        if data.get("username") and data.get("password"):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _save_credentials(username: str, password: str) -> None:
+    CREDS_FILE.write_text(json.dumps({"username": username, "password": password}))
+
+
+def is_logged_in() -> bool:
+    return _load_credentials() is not None
+
+
+def login(username: str, password: str) -> None:
+    """Persist GCD credentials. They're attached as HTTP Basic auth on every
+    subsequent API call, which gives us a much higher per-hour quota than the
+    anonymous limit. Credentials are saved to DATA_DIR in plaintext JSON —
+    same trust model as the Inducks session cookie."""
+    if not username or not password:
+        raise ValueError("Username and password required")
+    _save_credentials(username, password)
+
+
+def logout() -> None:
+    CREDS_FILE.unlink(missing_ok=True)
+
+
 def _client() -> httpx.Client:
+    creds = _load_credentials()
+    auth = (creds["username"], creds["password"]) if creds else None
     return httpx.Client(
         timeout=20,
         follow_redirects=True,
         headers={"Accept": "application/json", "User-Agent": "ComicVault/1.0"},
+        auth=auth,
     )
 
 
@@ -183,9 +223,12 @@ def _enrich_worker(pub_id: int, db_path: str) -> None:
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
+        # Only retry rows we haven't asked GCD about yet (cover_url IS NULL).
+        # An empty string means GCD told us there's no cover for that issue —
+        # re-asking would just consume rate-limit quota for the same answer.
         rows = conn.execute(
             "SELECT id, source_id FROM custom_issue "
-            "WHERE publication_id = ? AND (cover_url IS NULL OR cover_url = '') "
+            "WHERE publication_id = ? AND cover_url IS NULL "
             "ORDER BY position",
             (pub_id,),
         ).fetchall()

@@ -6,6 +6,7 @@ require a free account and are fetched via an HR proxy on inducks.org.
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import sqlite3
@@ -19,7 +20,11 @@ from pathlib import Path
 import httpx
 
 from . import cache
-from .config import DB_PATH, SESSION_FILE
+from .config import DATA_DIR, DB_PATH, SESSION_FILE
+
+# Credentials kept on disk so an expired session can re-authenticate without
+# pestering the user. Plaintext JSON, same trust model as the session cookie.
+CREDS_FILE = DATA_DIR / "inducks_credentials.json"
 
 ISV_URL = "https://inducks.org/inducks/isv.tgz"
 LOGIN_URL = "https://inducks.org/maccount.php"
@@ -252,13 +257,28 @@ def _save_cookie(cookie: str) -> None:
     SESSION_FILE.write_text(cookie)
 
 
-def login(username: str, password: str) -> None:
-    """Authenticate against inducks.org and persist the session cookie."""
+def _load_credentials() -> dict | None:
+    if not CREDS_FILE.exists():
+        return None
+    try:
+        data = json.loads(CREDS_FILE.read_text())
+        if data.get("username") and data.get("password"):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _save_credentials(username: str, password: str) -> None:
+    CREDS_FILE.write_text(json.dumps({"username": username, "password": password}))
+
+
+def _do_login(username: str, password: str) -> None:
+    """POST to inducks.org/maccount.php and persist the resulting cookie.
+    Caller is responsible for storing/clearing credentials separately."""
     with httpx.Client(follow_redirects=False, timeout=20) as client:
-        # Seed cookies on the login page
         seed = client.get(LOGIN_URL)
         cookies = dict(seed.cookies)
-
         resp = client.post(
             LOGIN_URL,
             data={
@@ -272,16 +292,44 @@ def login(username: str, password: str) -> None:
         merged = {**cookies, **dict(resp.cookies)}
         if not merged:
             raise RuntimeError("Inducks login failed — no cookies issued")
-
         _save_cookie("; ".join(f"{k}={v}" for k, v in merged.items()))
 
 
+def login(username: str, password: str) -> None:
+    """User-initiated login: log in *and* save the credentials so we can
+    silently re-authenticate when the session later expires."""
+    _do_login(username, password)
+    _save_credentials(username, password)
+
+
+def _try_relogin() -> bool:
+    """Best-effort silent re-login from saved credentials. Returns True iff a
+    fresh cookie is now on disk."""
+    creds = _load_credentials()
+    if not creds:
+        return False
+    try:
+        _do_login(creds["username"], creds["password"])
+        return _load_cookie() is not None
+    except Exception:
+        return False
+
+
+def _clear_session() -> None:
+    """Drop only the session cookie (kept credentials so we can re-login)."""
+    SESSION_FILE.unlink(missing_ok=True)
+
+
 def is_logged_in() -> bool:
-    return _load_cookie() is not None
+    """We're 'logged in' as long as credentials are saved — they let us mint
+    a fresh session on demand even when the cookie has gone stale."""
+    return _load_credentials() is not None or _load_cookie() is not None
 
 
 def logout() -> None:
+    """User-initiated logout: clear both the cookie and the saved credentials."""
     SESSION_FILE.unlink(missing_ok=True)
+    CREDS_FILE.unlink(missing_ok=True)
 
 
 def _resolve_cover_url(conn: sqlite3.Connection, issuecode: str) -> str | None:
@@ -319,6 +367,15 @@ def _resolve_cover_url(conn: sqlite3.Connection, issuecode: str) -> str | None:
     return row[0] if row else None
 
 
+def _hr_get(hr_url: str, cookie: str) -> httpx.Response:
+    with httpx.Client(follow_redirects=True, timeout=20) as client:
+        return client.get(hr_url, headers={"Cookie": cookie})
+
+
+def _is_login_wall(resp: httpx.Response) -> bool:
+    return resp.status_code == 401 or b"Please log in" in resp.content[:500]
+
+
 def fetch_cover_for_issue(conn: sqlite3.Connection, issuecode: str) -> tuple[Path, str] | None:
     """Return (path, mime) for a cached or freshly fetched cover. None if no
     image is registered in Inducks for the issue."""
@@ -328,19 +385,31 @@ def fetch_cover_for_issue(conn: sqlite3.Connection, issuecode: str) -> tuple[Pat
 
     cookie = _load_cookie()
     if not cookie:
-        raise PermissionError("Not logged in to inducks.org")
+        # No active session — try to mint one from saved credentials.
+        if not _try_relogin():
+            raise PermissionError("Not logged in to inducks.org")
+        cookie = _load_cookie()
+        if not cookie:
+            raise PermissionError("Not logged in to inducks.org")
 
     full_url = _resolve_cover_url(conn, issuecode)
     if not full_url:
         return None
 
     hr_url = f"{HR_URL}?normalsize=1&image={urllib.parse.quote(full_url, safe='')}"
-    with httpx.Client(follow_redirects=True, timeout=20) as client:
-        resp = client.get(hr_url, headers={"Cookie": cookie})
+    resp = _hr_get(hr_url, cookie)
 
-    if resp.status_code == 401 or b"Please log in" in resp.content[:500]:
-        logout()
-        raise PermissionError("Inducks session expired")
+    # Cookie may have expired between requests — drop it, re-login, retry once.
+    if _is_login_wall(resp):
+        _clear_session()
+        if _try_relogin():
+            cookie = _load_cookie()
+            if cookie:
+                resp = _hr_get(hr_url, cookie)
+        if _is_login_wall(resp):
+            _clear_session()
+            raise PermissionError("Inducks session expired and re-login failed")
+
     if resp.status_code != 200:
         raise RuntimeError(f"Inducks HR returned HTTP {resp.status_code}")
 
@@ -359,7 +428,9 @@ def fetch_icon_for_publication(conn: sqlite3.Connection, publicationcode: str) -
         """
         SELECT issuecode FROM inducks_issue
         WHERE publicationcode = ?
-        ORDER BY oldestdate, issuenumber
+        ORDER BY substr(COALESCE(oldestdate, '9999'), 1, 4),
+                 CAST(issuenumber AS INTEGER),
+                 issuenumber
         LIMIT 1
         """,
         (publicationcode,),

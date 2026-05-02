@@ -191,7 +191,7 @@ def _custom_issue_detail(issue_id: int):
     with get_conn() as conn:
         # Lazy-fetch GCD details (title/date/cover) on first detail view too,
         # so the detail page shows real data even before the cover loads.
-        row = _enrich_custom_issue(conn, issue_id)
+        row = _get_custom_issue(conn, issue_id)
         if not row:
             raise HTTPException(404, "Issue not found")
         pub = conn.execute(
@@ -451,7 +451,13 @@ def publication_detail(publicationcode: str, year: Optional[str] = None):
             SELECT i.issuecode, i.issuenumber, i.title, i.oldestdate
             FROM inducks_issue i
             {issue_where}
-            ORDER BY i.oldestdate, i.issuenumber
+            -- Group by year-prefix so a partial date like '1968' doesn't
+            -- sort before '1968-05-28'. Within a year, prefer the issue
+            -- number's numeric value ('2' < '10') and fall back to a string
+            -- compare for non-numeric tags ('1A' / 'supplement' / etc.).
+            ORDER BY substr(COALESCE(i.oldestdate, '9999'), 1, 4),
+                     CAST(i.issuenumber AS INTEGER),
+                     i.issuenumber
             """,
             issue_params,
         ).fetchall()
@@ -579,44 +585,79 @@ def issue_detail(issuecode: str):
 def search(q: str = Query(..., min_length=2), limit: int = 30):
     like = f"%{q}%"
     with get_conn() as conn:
-        if not has_inducks_data():
-            return {"publications": [], "issues": [], "stories": []}
+        has_inducks = has_inducks_data()
 
-        publications = conn.execute(
-            """
-            SELECT publicationcode, title, countrycode
-            FROM inducks_publication
-            WHERE title LIKE ?
-            ORDER BY title LIMIT ?
-            """,
-            (like, limit),
-        ).fetchall()
-
-        issues = conn.execute(
-            """
-            SELECT i.issuecode, i.title, i.issuenumber, i.publicationcode, p.title AS pub_title
-            FROM inducks_issue i
-            LEFT JOIN inducks_publication p ON p.publicationcode = i.publicationcode
-            WHERE i.title LIKE ?
-            ORDER BY i.title LIMIT ?
-            """,
-            (like, limit),
-        ).fetchall()
-
-        stories = conn.execute(
-            """
-            SELECT s.storycode, s.title, e.issuecode, p.title AS pub_title
-            FROM inducks_story s
-            JOIN inducks_storyversion sv ON sv.storycode = s.storycode
-            JOIN inducks_entry e         ON e.storyversioncode = sv.storyversioncode
-            LEFT JOIN inducks_issue i        ON i.issuecode = e.issuecode
-            LEFT JOIN inducks_publication p  ON p.publicationcode = i.publicationcode
-            WHERE s.title LIKE ?
-            GROUP BY s.storycode
-            ORDER BY s.title LIMIT ?
-            """,
-            (like, limit),
-        ).fetchall()
+        # Publications: combine Inducks + custom (cp:<id>) so GCD imports
+        # show up alongside Inducks publications.
+        if has_inducks:
+            publications = conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT publicationcode, title, countrycode
+                    FROM inducks_publication WHERE title LIKE ?
+                    UNION ALL
+                    SELECT 'cp:' || id AS publicationcode, title, countrycode
+                    FROM custom_publication WHERE title LIKE ?
+                )
+                ORDER BY title LIMIT ?
+                """,
+                (like, like, limit),
+            ).fetchall()
+            issues = conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT i.issuecode, i.title, i.issuenumber, i.publicationcode,
+                           p.title AS pub_title
+                    FROM inducks_issue i
+                    LEFT JOIN inducks_publication p ON p.publicationcode = i.publicationcode
+                    WHERE i.title LIKE ?
+                    UNION ALL
+                    SELECT 'ci:' || cii.id AS issuecode, cii.title, cii.issuenumber,
+                           'cp:' || cp.id AS publicationcode, cp.title AS pub_title
+                    FROM custom_issue cii
+                    JOIN custom_publication cp ON cp.id = cii.publication_id
+                    WHERE cii.title LIKE ?
+                )
+                ORDER BY title LIMIT ?
+                """,
+                (like, like, limit),
+            ).fetchall()
+            stories = conn.execute(
+                """
+                SELECT s.storycode, s.title, e.issuecode, p.title AS pub_title
+                FROM inducks_story s
+                JOIN inducks_storyversion sv ON sv.storycode = s.storycode
+                JOIN inducks_entry e         ON e.storyversioncode = sv.storyversioncode
+                LEFT JOIN inducks_issue i        ON i.issuecode = e.issuecode
+                LEFT JOIN inducks_publication p  ON p.publicationcode = i.publicationcode
+                WHERE s.title LIKE ?
+                GROUP BY s.storycode
+                ORDER BY s.title LIMIT ?
+                """,
+                (like, limit),
+            ).fetchall()
+        else:
+            # No Inducks tables yet — search custom only.
+            publications = conn.execute(
+                """
+                SELECT 'cp:' || id AS publicationcode, title, countrycode
+                FROM custom_publication WHERE title LIKE ?
+                ORDER BY title LIMIT ?
+                """,
+                (like, limit),
+            ).fetchall()
+            issues = conn.execute(
+                """
+                SELECT 'ci:' || cii.id AS issuecode, cii.title, cii.issuenumber,
+                       'cp:' || cp.id AS publicationcode, cp.title AS pub_title
+                FROM custom_issue cii
+                JOIN custom_publication cp ON cp.id = cii.publication_id
+                WHERE cii.title LIKE ?
+                ORDER BY cii.title LIMIT ?
+                """,
+                (like, limit),
+            ).fetchall()
+            stories = []
 
     return {
         "publications": [dict(r) for r in publications],
@@ -808,6 +849,31 @@ class GcdImportIn(BaseModel):
     series_id: str
 
 
+class GcdLoginIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.get("/api/gcd/account")
+def gcd_account():
+    return {"logged_in": gcd.is_logged_in()}
+
+
+@app.post("/api/gcd/login")
+def gcd_login(body: GcdLoginIn):
+    try:
+        gcd.login(body.username, body.password)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/gcd/logout")
+def gcd_logout():
+    gcd.logout()
+    return {"ok": True}
+
+
 @app.get("/api/gcd/search")
 def gcd_search(q: str = Query(..., min_length=2)):
     try:
@@ -825,7 +891,11 @@ def custom_publications_list():
                    cp.languagecode, cp.publisher, cp.year_began, cp.year_ended,
                    COUNT(cii.id) AS issue_count,
                    SUM(CASE WHEN cii.cover_url IS NOT NULL AND cii.cover_url != ''
-                            THEN 1 ELSE 0 END) AS enriched_count
+                            THEN 1 ELSE 0 END) AS enriched_count,
+                   SUM(CASE WHEN cii.cover_url = ''
+                            THEN 1 ELSE 0 END) AS no_cover_count,
+                   SUM(CASE WHEN cii.cover_url IS NULL
+                            THEN 1 ELSE 0 END) AS pending_count
             FROM custom_publication cp
             LEFT JOIN custom_issue cii ON cii.publication_id = cp.id
             GROUP BY cp.id
@@ -961,44 +1031,17 @@ def _placeholder() -> Response:
     )
 
 
-def _enrich_custom_issue(conn, issue_id: int) -> dict | None:
-    """Lazy-fetch missing GCD metadata (cover URL, date, title) for a custom
-    issue. Persists what it finds. Returns the up-to-date row as a dict, or
-    None if the issue does not exist."""
+def _get_custom_issue(conn, issue_id: int) -> dict | None:
+    """Return the stored custom_issue row as a dict, or None. Never hits the
+    network — populating cover_url / title / date from GCD is the background
+    enrichment job's responsibility, so request handlers stay snappy even
+    while GCD is rate-limiting us."""
     row = conn.execute(
         "SELECT id, source_id, issuenumber, title, oldestdate, cover_url "
         "FROM custom_issue WHERE id = ?",
         (issue_id,),
     ).fetchone()
-    if not row:
-        return None
-    if row["cover_url"] or not row["source_id"]:
-        return dict(row)
-    # While GCD is asking us to back off, skip the API call entirely so the
-    # cover endpoint falls through to the placeholder without waiting out the
-    # full cooldown. The background enrichment job will catch up later.
-    if gcd.throttle_seconds_remaining() > 0:
-        return dict(row)
-    try:
-        meta = gcd.fetch_issue(row["source_id"])
-    except Exception:
-        return dict(row)
-    conn.execute(
-        """
-        UPDATE custom_issue
-        SET cover_url = ?,
-            title = COALESCE(NULLIF(title, ''), ?),
-            oldestdate = COALESCE(NULLIF(oldestdate, ''), ?)
-        WHERE id = ?
-        """,
-        (meta["cover_url"], meta["title"], meta["oldestdate"], issue_id),
-    )
-    return {
-        **dict(row),
-        "cover_url": meta["cover_url"],
-        "title": row["title"] or meta["title"],
-        "oldestdate": row["oldestdate"] or meta["oldestdate"],
-    }
+    return dict(row) if row else None
 
 
 @app.get("/api/covers/issue/{issuecode:path}")
@@ -1009,7 +1052,7 @@ def cover_issue(issuecode: str):
     try:
         if _is_custom_issue(issuecode):
             with get_conn() as conn:
-                row = _enrich_custom_issue(conn, _custom_issue_id(issuecode))
+                row = _get_custom_issue(conn, _custom_issue_id(issuecode))
             if not row:
                 return _placeholder()
             res = gcd.fetch_cover(issuecode, row["cover_url"] or "")

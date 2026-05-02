@@ -18,26 +18,28 @@
 
   <!-- ---------- header ---------- -->
   <header class="sticky top-0 z-20 bg-white border-b">
-    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
-      <a href="#/" class="font-bold text-lg shrink-0">📚 ComicVault</a>
-      <nav class="hidden md:flex gap-3 text-sm text-slate-600">
+    <div class="max-w-6xl mx-auto px-3 sm:px-4 py-2 flex flex-wrap items-center gap-x-3 gap-y-2">
+      <a href="#/" class="font-bold text-base sm:text-lg shrink-0">📚 ComicVault</a>
+      <nav class="flex gap-3 text-sm text-slate-600">
         <a href="#/" class="hover:text-slate-900">Browse</a>
         <a href="#/collection" class="hover:text-slate-900">Collection</a>
         <a href="#/settings" class="hover:text-slate-900">Settings</a>
       </nav>
-      <div class="flex-1"></div>
-      <input
-        v-model="searchInput"
-        @keydown.enter="doSearch"
-        type="search" placeholder="Search publications & stories…"
-        class="border rounded px-3 py-1.5 text-sm w-64 focus:outline-none focus:ring focus:ring-blue-200"
-      />
-      <select v-model="filter"
-              class="border rounded px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring focus:ring-blue-200">
-        <option value="all">All</option>
-        <option value="owned">Owned only</option>
-        <option value="missing">Missing only</option>
-      </select>
+      <!-- Search + filter: full-width second row on mobile, right-aligned on desktop. -->
+      <div class="w-full sm:w-auto sm:flex-1 sm:min-w-0 flex gap-2 items-center sm:justify-end order-last sm:order-none">
+        <input
+          v-model="searchInput"
+          @keydown.enter="doSearch"
+          type="search" placeholder="Search publications & stories…"
+          class="border rounded px-3 py-1.5 text-sm flex-1 min-w-0 sm:flex-none sm:w-56 md:w-72 focus:outline-none focus:ring focus:ring-blue-200"
+        />
+        <select v-model="filter"
+                class="border rounded px-2 py-1.5 text-sm bg-white shrink-0 focus:outline-none focus:ring focus:ring-blue-200">
+          <option value="all">All</option>
+          <option value="owned">Owned only</option>
+          <option value="missing">Missing only</option>
+        </select>
+      </div>
     </div>
   </header>
 
@@ -129,7 +131,7 @@
             <div class="aspect-[3/4] mb-1 overflow-hidden rounded cover-fallback">
               <img loading="lazy"
                    :src="'/api/covers/publication/'+encodeURIComponent(p.publicationcode)"
-                   class="w-full h-full object-cover"
+                   class="w-full h-full object-contain"
                    @error="$event.target.style.display='none'" />
             </div>
             <div class="font-medium truncate" :title="p.title">{{ p.title }}</div>
@@ -233,7 +235,7 @@
           <div class="aspect-[3/4] mb-1 overflow-hidden rounded cover-fallback">
             <img loading="lazy"
                  :src="'/api/covers/issue/'+encodeURIComponent(i.issuecode)"
-                 class="w-full h-full object-cover"
+                 class="w-full h-full object-contain"
                  @error="$event.target.style.display='none'" />
           </div>
           <div class="font-medium truncate">#{{ i.issuenumber }}</div>
@@ -281,7 +283,7 @@
           <div class="aspect-[3/4] rounded overflow-hidden cover-fallback">
             <img loading="lazy"
                  :src="'/api/covers/issue/'+encodeURIComponent(issue.issuecode)"
-                 class="w-full h-full object-cover"
+                 class="w-full h-full object-contain"
                  @error="$event.target.style.display='none'" />
           </div>
         </div>
@@ -377,13 +379,14 @@
       <p v-if="!collection.length" class="text-slate-500">
         Nothing here yet. Browse a publication and add a copy of an issue.
       </p>
-      <table v-else class="w-full text-sm bg-white border rounded">
+      <div v-else class="overflow-x-auto -mx-3 sm:mx-0">
+      <table class="w-full text-sm bg-white border rounded">
         <thead class="bg-slate-100 text-left">
           <tr>
-            <th class="p-2">Publication</th>
-            <th class="p-2">Issue</th>
-            <th class="p-2">Location</th>
-            <th class="p-2">Condition</th>
+            <th class="p-2 whitespace-nowrap">Publication</th>
+            <th class="p-2 whitespace-nowrap">Issue</th>
+            <th class="p-2 whitespace-nowrap">Location</th>
+            <th class="p-2 whitespace-nowrap">Condition</th>
             <th class="p-2">Notes</th>
             <th></th>
           </tr>
@@ -391,20 +394,21 @@
         <tbody>
           <tr v-for="o in collection" :key="o.id" class="border-t">
             <td class="p-2">{{ o.publication_title }}</td>
-            <td class="p-2">
+            <td class="p-2 whitespace-nowrap">
               <a :href="'#/issue/'+encodeURIComponent(o.issuecode)" class="text-blue-600 underline">
                 #{{ o.issuenumber }}
               </a>
             </td>
-            <td class="p-2">{{ o.location_name || '—' }}</td>
-            <td class="p-2">{{ o.condition || '—' }}</td>
+            <td class="p-2 whitespace-nowrap">{{ o.location_name || '—' }}</td>
+            <td class="p-2 whitespace-nowrap">{{ o.condition || '—' }}</td>
             <td class="p-2">{{ o.notes }}</td>
-            <td class="p-2 text-right">
+            <td class="p-2 text-right whitespace-nowrap">
               <button class="text-red-600 hover:underline" @click="deleteCopy(o, true)">remove</button>
             </td>
           </tr>
         </tbody>
       </table>
+      </div>
     </section>
 
     <!-- ---------- settings (consolidated) ---------- -->
@@ -477,6 +481,45 @@
         </div>
       </div>
 
+      <!-- GCD account -->
+      <div class="bg-white border rounded-lg p-5 mb-4">
+        <h2 class="font-semibold text-lg mb-3">GCD account</h2>
+        <p class="text-slate-600 text-sm mb-3">
+          The Grand Comics Database rate-limits anonymous API access aggressively.
+          Logging in with a free
+          <a class="text-blue-600 underline" target="_blank" href="https://www.comics.org/accounts/register/">comics.org</a>
+          account gives you a much higher per-hour quota — recommended before importing a large series.
+        </p>
+        <div v-if="gcdAccount.logged_in" class="flex items-center gap-3 text-sm">
+          <span class="inline-flex items-center gap-1 text-emerald-700">
+            <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+            Logged in
+          </span>
+          <button class="text-slate-600 hover:text-slate-900 underline" @click="gcdLogout">Log out</button>
+          <button class="text-blue-600 hover:text-blue-800 underline"
+                  @click="showGcdLoginForm = !showGcdLoginForm">
+            {{ showGcdLoginForm ? 'Cancel' : 'Change credentials' }}
+          </button>
+        </div>
+        <div v-else class="text-sm mb-2">
+          <span class="inline-flex items-center gap-1 text-amber-700">
+            <span class="w-2 h-2 rounded-full bg-amber-500"></span>
+            Not logged in (anonymous, low rate limit)
+          </span>
+        </div>
+        <form v-if="!gcdAccount.logged_in || showGcdLoginForm"
+              class="flex flex-col gap-2 max-w-sm mt-3" @submit.prevent="gcdLogin">
+          <input v-model="gcdLoginForm.username" placeholder="comics.org username"
+                 class="border rounded px-3 py-1.5" required />
+          <input v-model="gcdLoginForm.password" placeholder="password"
+                 type="password" class="border rounded px-3 py-1.5" required />
+          <button class="bg-blue-600 text-white rounded py-2 hover:bg-blue-700">
+            {{ gcdAccount.logged_in ? 'Update credentials' : 'Log in' }}
+          </button>
+          <p v-if="gcdLoginError" class="text-red-600 text-sm">{{ gcdLoginError }}</p>
+        </form>
+      </div>
+
       <!-- GCD imports — non-Disney comics -->
       <div class="bg-white border rounded-lg p-5 mb-4">
         <h2 class="font-semibold text-lg mb-1">Imported series (GCD)</h2>
@@ -498,13 +541,15 @@
                 <span class="text-slate-500">
                   · {{ cp.year_began || '?' }}–{{ cp.year_ended || '?' }}
                   · {{ cp.publisher || cp.countrycode }}
-                  · {{ cp.enriched_count }} / {{ cp.issue_count }} covers
+                  · {{ cp.enriched_count }} / {{ cp.issue_count }} covers<span
+                    v-if="cp.no_cover_count" class="text-amber-600">
+                    · {{ cp.no_cover_count }} not on GCD</span>
                 </span>
               </div>
               <div class="flex gap-3 shrink-0">
-                <button v-if="!cp.enrich_status.running && cp.enriched_count < cp.issue_count"
+                <button v-if="!cp.enrich_status.running && cp.pending_count > 0"
                         class="text-blue-600 text-xs hover:underline"
-                        @click="enrichCustomPub(cp)">fetch missing covers</button>
+                        @click="enrichCustomPub(cp)">fetch {{ cp.pending_count }} missing</button>
                 <button class="text-red-600 text-xs hover:underline"
                         @click="deleteCustomPub(cp)">remove</button>
               </div>
@@ -660,6 +705,10 @@ createApp({
     const gcdSearchedOnce  = ref(false);
     const gcdImporting     = ref(null);
     const customPubs       = ref([]);
+    const gcdAccount       = reactive({ logged_in: false });
+    const gcdLoginForm     = reactive({ username: '', password: '' });
+    const gcdLoginError    = ref('');
+    const showGcdLoginForm = ref(false);
 
     const loginForm = reactive({ username: '', password: '' });
     const loginError = ref('');
@@ -747,6 +796,7 @@ createApp({
           await ensureConditions(true);
           Object.assign(appSettings, await J('/api/app-settings'));
           customPubs.value = await J('/api/custom-publications');
+          Object.assign(gcdAccount, await J('/api/gcd/account'));
         }
       } catch (e) {
         console.error(e);
@@ -815,6 +865,21 @@ createApp({
     };
     const ensureConditions = async (force = false) => {
       if (force || !conditions.value.length) conditions.value = await J('/api/conditions');
+    };
+
+    const gcdLogin = async () => {
+      gcdLoginError.value = '';
+      try {
+        await J('/api/gcd/login', { method: 'POST', body: JSON.stringify(gcdLoginForm) });
+        gcdLoginForm.password = '';
+        showGcdLoginForm.value = false;
+        Object.assign(gcdAccount, await J('/api/gcd/account'));
+      } catch (e) { gcdLoginError.value = e.message; }
+    };
+
+    const gcdLogout = async () => {
+      await J('/api/gcd/logout', { method: 'POST' });
+      Object.assign(gcdAccount, await J('/api/gcd/account'));
     };
 
     const searchGcd = async () => {
@@ -1008,6 +1073,8 @@ createApp({
       appSettings, saveAppSettings,
       gcdQuery, gcdResults, gcdSearching, gcdSearchedOnce, gcdImporting,
       customPubs, searchGcd, importGcd, deleteCustomPub, enrichCustomPub,
+      gcdAccount, gcdLoginForm, gcdLoginError, showGcdLoginForm,
+      gcdLogin, gcdLogout,
       loginForm, loginError, showLoginForm,
       countryHeading,
       doLogin, logout, startSync,
